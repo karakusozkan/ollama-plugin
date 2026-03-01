@@ -1,0 +1,96 @@
+{
+	"name": "ollama-agent",
+	"displayName": "Ollama Agent",
+	"description": "An AI coding agent powered by Ollama running locally",
+	"version": "0.0.1",
+	"publisher": "ollama-agent",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"AI",
+		"Other"
+	],
+	"keywords": [
+		"ollama",
+		"ai",
+		"agent",
+		"coding",
+		"llm"
+	],
+	"activationEvents": [
+
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "ollamaAgent.run",
+				"title": "Ollama Agent: Run",
+				"icon": "$(robot)"
+			},
+			{
+				"command": "ollamaAgent.openChat",
+				"title": "Ollama Agent: Chat",
+				"icon": "$(comment-discussion)"
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "ollama-agent-sidebar",
+					"title": "Ollama",
+					"icon": "$(comment-discussion)"
+				}
+			]
+		},
+		"views": {
+			"ollama-agent-sidebar": [
+				{
+					"icon": "$(comment-discussion)",
+					"type": "webview",
+					"id": "ollamaAgent.chatView",
+					"name": "Chat"
+				}
+			]
+		},
+		"configuration": {
+			"title": "Ollama Agent",
+			"properties": {
+				"ollamaAgent.endpoint": {
+					"type": "string",
+					"default": "http://localhost:11435/v1/chat/completions",
+					"description": "Ollama API endpoint (OpenAI-compatible)"
+				},
+				"ollamaAgent.model": {
+					"type": "string",
+					"default": "qwen2.5-coder:32b",
+					"description": "Model name to use for the agent"
+				},
+				"ollamaAgent.temperature": {
+					"type": "number",
+					"default": 0.2,
+					"minimum": 0,
+					"maximum": 2,
+					"description": "Sampling temperature for the LLM"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"pretest": "npm run compile",
+		"test": "node ./out/test/runTest.js",
+		"package": "vsce package"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"@types/vscode": "^1.85.0",
+		"@typescript-eslint/eslint-plugin": "^7.0.0",
+		"@typescript-eslint/parser": "^7.0.0",
+		"eslint": "^8.0.0",
+		"typescript": "^5.3.0"
+	}
+}
