@@ -18,9 +18,7 @@
 		"coding",
 		"llm"
 	],
-	"activationEvents": [
-
-	],
+	"activationEvents": [],
 	"main": "./out/extension.js",
 	"contributes": {
 		"commands": [
@@ -73,6 +71,53 @@
 					"minimum": 0,
 					"maximum": 2,
 					"description": "Sampling temperature for the LLM"
+				},
+				"ollamaAgent.mcpServers": {
+					"type": "array",
+					"default": [],
+					"description": "MCP (Model Context Protocol) servers to connect to. Each server exposes tools that the agent can use.",
+					"items": {
+						"type": "object",
+						"required": [
+							"name",
+							"command"
+						],
+						"properties": {
+							"name": {
+								"type": "string",
+								"description": "Display name for this MCP server"
+							},
+							"command": {
+								"type": "string",
+								"description": "Command to launch the MCP server (e.g. 'npx', 'python', 'uvx')"
+							},
+							"args": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"default": [],
+								"description": "Arguments for the command"
+							},
+							"env": {
+								"type": "object",
+								"additionalProperties": {
+									"type": "string"
+								},
+								"default": {},
+								"description": "Environment variables to set for the server process"
+							},
+							"cwd": {
+								"type": "string",
+								"description": "Working directory for the server process (defaults to workspace root)"
+							},
+							"enabled": {
+								"type": "boolean",
+								"default": true,
+								"description": "Whether this server is enabled"
+							}
+						}
+					}
 				}
 			}
 		}

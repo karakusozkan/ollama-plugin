@@ -1,3 +1,5 @@
+import { McpManager } from "./mcp.js";
+
 /**
  * Every action the agent is allowed to take must be listed here.
  * The discriminated union enforces full type safety throughout the pipeline.
@@ -9,7 +11,8 @@ export type ToolAction =
   | { tool: "read_file"; path: string }
   | { tool: "run_command"; command: string }
   | { tool: "fetch_url"; url: string }
-  | { tool: "parse_content"; html: string };
+  | { tool: "parse_content"; html: string }
+  | { tool: "mcp_tool"; server: string; name: string; arguments: Record<string, unknown> };
 
 /**
  * Detect the current operating system and return a descriptor string.
@@ -92,8 +95,9 @@ Additional notes:
  * information at runtime, ensuring the LLM always generates commands
  * appropriate for the host operating system.
  */
-export function buildSystemPrompt(): string {
+export function buildSystemPrompt(mcpManager?: McpManager): string {
   const os = getOSDescriptor();
+  const mcpToolsSection = mcpManager ? mcpManager.buildToolsDescription() : "";
   return `\
 You are an expert coding agent embedded inside VS Code.
 You have FULL READ AND WRITE ACCESS to every file in the user's open workspace,
@@ -160,7 +164,7 @@ When the user asks about web content:
 "thought" is mandatory and is shown to the user. When actions is empty (task complete), "thought" should contain your FULL answer, summary, or explanation — not just a brief description of what you did.
 For example, if the user asked you to summarize a web page, put the full summary in "thought".
 If the task is not complete, you MUST include actions to continue working on it.
-`;
+${mcpToolsSection}`;
 }
 
 /** @deprecated Use buildSystemPrompt() instead — kept for backward compatibility */

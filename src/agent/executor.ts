@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import * as https from "https";
 import * as http from "http";
 import { ToolAction } from "./tools";
+import { McpManager } from "./mcp.js";
 
 export interface ActionResult {
 	action: ToolAction;
@@ -11,21 +12,21 @@ export interface ActionResult {
 	output?: string; // non-empty for read_file or errors
 }
 
-// 
+//
 
-export async function executeActions(actions: ToolAction[], abortSignal?: AbortSignal): Promise<ActionResult[]> {
+export async function executeActions(actions: ToolAction[], abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult[]> {
 	const results: ActionResult[] = [];
 	for (const action of actions) {
 		if (abortSignal?.aborted) {
 			results.push({ action, success: false, output: "Operation cancelled by user." });
 			break;
 		}
-		results.push(await executeOne(action, abortSignal));
+		results.push(await executeOne(action, abortSignal, mcpManager));
 	}
 	return results;
 }
 
-async function executeOne(action: ToolAction, abortSignal?: AbortSignal): Promise<ActionResult> {
+async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult> {
 	try {
 		switch (action.tool) {
 			case "create_file": {
@@ -110,6 +111,27 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal): Promis
 					return { action, success: true, output: text };
 				} catch (err) {
 					return { action, success: false, output: `Failed to parse HTML: ${err instanceof Error ? err.message : String(err)}` };
+				}
+			}
+	
+			case "mcp_tool": {
+				if (!mcpManager) {
+					return { action, success: false, output: "MCP tools are not available — no MCP servers are configured." };
+				}
+				const mcpAction = action as { tool: "mcp_tool"; server: string; name: string; arguments: Record<string, unknown> };
+				if (!mcpAction.server || !mcpAction.name) {
+					return { action, success: false, output: "mcp_tool: missing 'server' or 'name' field." };
+				}
+				try {
+					const result = await mcpManager.callTool(mcpAction.server, mcpAction.name, mcpAction.arguments || {});
+					// Extract text content from the MCP result
+					const textParts = (result.content || [])
+						.filter(c => c.type === "text" && c.text)
+						.map(c => c.text!);
+					const output = textParts.join("\n") || "(no text content returned)";
+					return { action, success: !result.isError, output };
+				} catch (err) {
+					return { action, success: false, output: `MCP tool error: ${err instanceof Error ? err.message : String(err)}` };
 				}
 			}
 		}

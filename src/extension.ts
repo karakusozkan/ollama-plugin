@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import { Agent } from "./agent/agent";
 import { OllamaProvider, estimateMessagesTokens, OllamaModel } from "./agent/llm";
+import { McpManager } from "./agent/mcp";
 import { listWorkspaceFiles } from "./utils/workspace";
 
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let mcpManager: McpManager;
 
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel("Ollama Agent");
@@ -12,6 +14,41 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const provider = new OllamaProvider();
   const agent = new Agent(provider);
+
+  // ── Initialize MCP Manager ──────────────────────────────────────────────────
+  mcpManager = new McpManager();
+  mcpManager.outputChannel = outputChannel;
+  agent.mcpManager = mcpManager;
+
+  // Connect to configured MCP servers on activation
+  mcpManager.loadFromSettings().then(() => {
+    if (mcpManager.connectedCount > 0) {
+      outputChannel.appendLine(`✅ ${mcpManager.connectedCount} MCP server(s) connected.`);
+    }
+  }).catch(err => {
+    outputChannel.appendLine(`❌ MCP initialization error: ${err}`);
+  });
+
+  // Re-connect MCP servers when settings change
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("ollamaAgent.mcpServers")) {
+        outputChannel.appendLine("MCP server configuration changed — reconnecting…");
+        mcpManager.loadFromSettings().then(() => {
+          outputChannel.appendLine(`✅ ${mcpManager.connectedCount} MCP server(s) connected after config change.`);
+        }).catch(err => {
+          outputChannel.appendLine(`❌ MCP reconnection error: ${err}`);
+        });
+      }
+    })
+  );
+
+  // Clean up MCP connections on deactivation
+  context.subscriptions.push({
+    dispose: () => {
+      mcpManager.disconnectAll();
+    }
+  });
 
   // ── ollamaAgent.run ───────────────────────────────────────────────────────
   const runCommand = vscode.commands.registerCommand(
@@ -61,7 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(runCommand);
 
   // ── Register the sidebar webview view provider ─────────────────────────────
-  const chatViewProvider = new OllamaChatViewProvider(context.extensionUri, provider);
+  const chatViewProvider = new OllamaChatViewProvider(context.extensionUri, provider, mcpManager);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       "ollamaAgent.chatView",
@@ -102,15 +139,17 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _extensionUri: vscode.Uri;
   private _provider: OllamaProvider;
+  private _mcpManager: McpManager;
   private _history: import("./agent/llm").Message[] = [];
   private _initialized = false;
   private _abortController: AbortController | null = null;
   private _selectedModel: string | null = null;
   private _availableModels: OllamaModel[] = [];
 
-  constructor(extensionUri: vscode.Uri, provider: OllamaProvider) {
+  constructor(extensionUri: vscode.Uri, provider: OllamaProvider, mcpManager: McpManager) {
     this._extensionUri = extensionUri;
     this._provider = provider;
+    this._mcpManager = mcpManager;
   }
 
   private _getContextWindowSize(): number {
@@ -209,7 +248,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
             : "\n\n(No workspace folder is open.)";
 
           const { buildSystemPrompt } = await import("./agent/tools.js");
-          this._history.push({ role: "system", content: buildSystemPrompt() + fileList });
+          this._history.push({ role: "system", content: buildSystemPrompt(this._mcpManager) + fileList });
           this._initialized = true;
           this._updateContextDisplay();
         }
@@ -304,7 +343,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
           }
 
           // Execute the requested actions
-          const results = await executeActions(actions, abortSignal);
+          const results = await executeActions(actions, abortSignal, this._mcpManager);
 
           // Log to output channel
           outputChannel.appendLine(`\n── Chat iteration ${iteration + 1} ──────────────────────`);
@@ -320,11 +359,13 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
               ? (r.action as { command: string }).command
               : "url" in r.action
               ? (r.action as { url: string }).url
+              : r.action.tool === "mcp_tool"
+              ? `${(r.action as { server: string; name: string }).server}/${(r.action as { server: string; name: string }).name}`
               : "";
             const icon = r.success ? "✅" : "❌";
             summaryLines.push(`${icon} \`${r.action.tool}\`${loc ? ` → ${loc}` : ""}`);
             outputChannel.appendLine(`  ${icon} ${r.action.tool}${loc ? ` → ${loc}` : ""}`);
-            if (r.output && (r.action.tool === "run_command" || r.action.tool === "fetch_url" || !r.success)) {
+            if (r.output && (r.action.tool === "run_command" || r.action.tool === "fetch_url" || r.action.tool === "mcp_tool" || !r.success)) {
               const indented = r.output.split("\n").map((l: string) => `     ${l}`).join("\n");
               outputChannel.appendLine(indented);
             }

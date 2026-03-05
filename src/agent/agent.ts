@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { LLMProvider, Message } from "./llm";
 import { buildSystemPrompt, ToolAction } from "./tools";
 import { executeActions, ActionResult } from "./executor";
+import { McpManager } from "./mcp.js";
 
 interface AgentResponse {
   thought: string;
@@ -81,12 +82,17 @@ function buildFeedbackMessage(results: ActionResult[]): string {
  */
 export class Agent {
   private readonly maxIterations = 8;
+  private _mcpManager?: McpManager;
 
   constructor(private readonly llm: LLMProvider) {}
 
+  set mcpManager(manager: McpManager | undefined) {
+    this._mcpManager = manager;
+  }
+
   async run(goal: string, output: vscode.OutputChannel): Promise<void> {
     const messages: Message[] = [
-      { role: "system", content: buildSystemPrompt() },
+      { role: "system", content: buildSystemPrompt(this._mcpManager) },
       { role: "user", content: goal },
     ];
 
@@ -114,7 +120,7 @@ export class Agent {
       }
 
       output.appendLine(`🔧 Executing ${parsed.actions.length} action(s)…`);
-      const results = await executeActions(parsed.actions);
+      const results = await executeActions(parsed.actions, undefined, this._mcpManager);
 
       for (const r of results) {
         const label = r.success ? "✅" : "❌";
