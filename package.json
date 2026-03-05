@@ -31,6 +31,11 @@
 				"command": "ollamaAgent.openChat",
 				"title": "Ollama Agent: Chat",
 				"icon": "$(comment-discussion)"
+			},
+			{
+				"command": "ollamaAgent.addMcpServer",
+				"title": "Ollama Agent: Add MCP Server",
+				"icon": "$(add)"
 			}
 		],
 		"viewsContainers": {
@@ -49,6 +54,12 @@
 					"type": "webview",
 					"id": "ollamaAgent.chatView",
 					"name": "Chat"
+				},
+				{
+					"icon": "$(server)",
+					"type": "webview",
+					"id": "ollamaAgent.mcpView",
+					"name": "MCP Servers"
 				}
 			]
 		},
@@ -117,6 +128,14 @@
 								"description": "Whether this server is enabled"
 							}
 						}
+					}
+				},
+				"ollamaAgent.mcpDisabledTools": {
+					"type": "array",
+					"default": [],
+					"description": "List of disabled MCP tools (format: 'serverName:toolName')",
+					"items": {
+						"type": "string"
 					}
 				}
 			}

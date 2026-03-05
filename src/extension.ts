@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { Agent } from "./agent/agent";
 import { OllamaProvider, estimateMessagesTokens, OllamaModel } from "./agent/llm";
-import { McpManager } from "./agent/mcp";
+import { McpManager, McpServerConfig } from "./agent/mcp";
 import { listWorkspaceFiles } from "./utils/workspace";
 
 let outputChannel: vscode.OutputChannel;
@@ -118,6 +118,27 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(openChatCommand);
 
+  // ── ollamaAgent.addMcpServer ─────────────────────────────────────────────────
+  const addMcpServerCommand = vscode.commands.registerCommand(
+    "ollamaAgent.addMcpServer",
+    async () => {
+      await addMcpServer(mcpManager, outputChannel);
+    }
+  );
+  context.subscriptions.push(addMcpServerCommand);
+
+  // ── Register the MCP servers webview view provider ───────────────────────────
+  const mcpViewProvider = new McpServersViewProvider(context.extensionUri, mcpManager, outputChannel);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      "ollamaAgent.mcpView",
+      mcpViewProvider,
+      {
+        webviewOptions: { retainContextWhenHidden: true }
+      }
+    )
+  );
+
   // Status bar item to toggle the chat
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
@@ -132,6 +153,525 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   // Nothing to clean up; subscriptions handle it
+}
+
+// ── Add MCP Server Command ─────────────────────────────────────────────────
+
+async function addMcpServer(mcpManager: McpManager, outputChannel: vscode.OutputChannel): Promise<void> {
+  // Get current MCP servers from settings
+  const config = vscode.workspace.getConfiguration("ollamaAgent");
+  const existingServers = config.get<McpServerConfig[]>("mcpServers", []);
+  
+  // Build list items: existing servers + "Add new server" option
+  const items: vscode.QuickPickItem[] = [
+    { label: "$(add) Add new MCP server", description: "Create a new MCP server configuration" }
+  ];
+  
+  for (const server of existingServers) {
+    const status = server.enabled ? "✅" : "❌";
+    items.push({
+      label: `${status} ${server.name}`,
+      description: `${server.command} ${(server.args || []).join(" ")}`,
+      detail: server.enabled ? "Enabled" : "Disabled"
+    });
+  }
+  
+  // Show quick pick to select server or add new
+  const selected = await vscode.window.showQuickPick(items, {
+    placeHolder: "Select an MCP server to manage or add a new one",
+    matchOnDescription: true,
+    matchOnDetail: true
+  });
+  
+  if (!selected) {
+    return;
+  }
+  
+  // Check if user selected "Add new server"
+  if (selected.label.includes("Add new MCP server")) {
+    await promptAndAddServer(mcpManager, outputChannel, existingServers);
+    return;
+  }
+  
+  // User selected an existing server - show management options
+  const serverName = selected.label.replace(/^[✅❌]\s*/, "");
+  const server = existingServers.find(s => s.name === serverName);
+  
+  if (!server) {
+    return;
+  }
+  
+  // Show actions for the selected server
+  const action = await vscode.window.showQuickPick(
+    [
+      { label: "$(debug-start) Enable", description: "Enable this MCP server" },
+      { label: "$(debug-stop) Disable", description: "Disable this MCP server" },
+      { label: "$(edit) Edit", description: "Edit this server configuration" },
+      { label: "$(trash) Remove", description: "Remove this MCP server" }
+    ],
+    {
+      placeHolder: `Manage server: ${serverName}`
+    }
+  );
+  
+  if (!action) {
+    return;
+  }
+  
+  if (action.label.includes("Enable")) {
+    server.enabled = true;
+    await saveAndReload(mcpManager, outputChannel, existingServers, `Enabled MCP server "${serverName}"`);
+  } else if (action.label.includes("Disable")) {
+    server.enabled = false;
+    await saveAndReload(mcpManager, outputChannel, existingServers, `Disabled MCP server "${serverName}"`);
+  } else if (action.label.includes("Edit")) {
+    await promptAndEditServer(mcpManager, outputChannel, existingServers, server);
+  } else if (action.label.includes("Remove")) {
+    const confirm = await vscode.window.showWarningMessage(
+      `Are you sure you want to remove "${serverName}"?`,
+      "Remove",
+      "Cancel"
+    );
+    if (confirm === "Remove") {
+      const index = existingServers.indexOf(server);
+      existingServers.splice(index, 1);
+      await saveAndReload(mcpManager, outputChannel, existingServers, `Removed MCP server "${serverName}"`);
+    }
+  }
+}
+
+async function promptAndAddServer(
+  mcpManager: McpManager, 
+  outputChannel: vscode.OutputChannel, 
+  servers: McpServerConfig[]
+): Promise<void> {
+  // Step 1: Ask for server name
+  const name = await vscode.window.showInputBox({
+    prompt: "MCP Server Name",
+    placeHolder: "e.g., filesystem",
+    validateInput: (value) => {
+      if (!value || value.trim().length === 0) {
+        return "Server name is required";
+      }
+      return null;
+    }
+  });
+  
+  if (!name) {
+    return;
+  }
+
+  // Step 2: Ask for command
+  const command = await vscode.window.showInputBox({
+    prompt: "Command to launch MCP server",
+    placeHolder: "e.g., npx, python, uvx",
+    validateInput: (value) => {
+      if (!value || value.trim().length === 0) {
+        return "Command is required";
+      }
+      return null;
+    }
+  });
+  
+  if (!command) {
+    return;
+  }
+
+  // Step 3: Ask for optional arguments
+  const argsInput = await vscode.window.showInputBox({
+    prompt: "Arguments for the command (comma-separated, optional)",
+    placeHolder: "e.g., -y, @modelcontextprotocol/server-filesystem, /path/to/folder"
+  });
+  
+  const args = argsInput 
+    ? argsInput.split(",").map(arg => arg.trim()).filter(arg => arg.length > 0)
+    : [];
+
+  // Step 4: Ask for optional working directory
+  const cwd = await vscode.window.showInputBox({
+    prompt: "Working directory (optional, leave empty for workspace root)",
+    placeHolder: "e.g., C:\\Projects\\my-folder"
+  });
+
+  // Step 5: Ask if server should be enabled
+  const enableServer = await vscode.window.showQuickPick(
+    ["Yes, enable immediately", "No, add as disabled"],
+    {
+      placeHolder: "Enable this MCP server immediately?"
+    }
+  );
+
+  if (!enableServer) {
+    return;
+  }
+
+  const shouldEnable = enableServer.startsWith("Yes");
+
+  // Create the new server configuration
+  const newServer: McpServerConfig = {
+    name: name.trim(),
+    command: command.trim(),
+    args: args.length > 0 ? args : undefined,
+    cwd: cwd?.trim() || undefined,
+    enabled: shouldEnable
+  };
+
+  // Get current MCP servers from settings
+  const config = vscode.workspace.getConfiguration("ollamaAgent");
+  const existingServers = config.get<McpServerConfig[]>("mcpServers", []);
+
+  // Check if a server with this name already exists
+  const existingIndex = existingServers.findIndex(s => s.name === newServer.name);
+  if (existingIndex >= 0) {
+    const replace = await vscode.window.showWarningMessage(
+      `A server named "${newServer.name}" already exists. Do you want to replace it?`,
+      "Replace",
+      "Cancel"
+    );
+    if (replace !== "Replace") {
+      return;
+    }
+    existingServers[existingIndex] = newServer;
+  } else {
+    existingServers.push(newServer);
+  }
+
+  // Save to settings
+  try {
+    await config.update("mcpServers", existingServers, vscode.ConfigurationTarget.Workspace);
+    
+    outputChannel.appendLine(`[MCP] Added/updated server: ${newServer.name}`);
+    
+    // Reload MCP servers
+    await mcpManager.loadFromSettings();
+    
+    if (mcpManager.connectedCount > 0) {
+      const toolsCount = mcpManager.getAllTools().length;
+      vscode.window.showInformationMessage(
+        `MCP server "${newServer.name}" added successfully! ${mcpManager.connectedCount} server(s) connected with ${toolsCount} tool(s) available.`
+      );
+    } else {
+      vscode.window.showWarningMessage(
+        `MCP server "${newServer.name}" added but could not connect. Check the output channel for details.`
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Failed to save MCP server: ${message}`);
+  }
+}
+
+async function saveAndReload(
+  mcpManager: McpManager,
+  outputChannel: vscode.OutputChannel,
+  servers: McpServerConfig[],
+  message: string
+): Promise<void> {
+  const config = vscode.workspace.getConfiguration("ollamaAgent");
+  try {
+    await config.update("mcpServers", servers, vscode.ConfigurationTarget.Workspace);
+    outputChannel.appendLine(`[MCP] ${message}`);
+    await mcpManager.loadFromSettings();
+    const toolsCount = mcpManager.getAllTools().length;
+    vscode.window.showInformationMessage(
+      `${message}. ${mcpManager.connectedCount} server(s) connected with ${toolsCount} tool(s) available.`
+    );
+  } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Failed to update MCP server: ${errMessage}`);
+  }
+}
+
+async function promptAndEditServer(
+  mcpManager: McpManager,
+  outputChannel: vscode.OutputChannel,
+  servers: McpServerConfig[],
+  server: McpServerConfig
+): Promise<void> {
+  // Ask for new command
+  const command = await vscode.window.showInputBox({
+    prompt: "Command to launch MCP server",
+    value: server.command,
+    validateInput: (value) => {
+      if (!value || value.trim().length === 0) {
+        return "Command is required";
+      }
+      return null;
+    }
+  });
+
+  if (!command) {
+    return;
+  }
+
+  // Ask for optional arguments
+  const argsInput = await vscode.window.showInputBox({
+    prompt: "Arguments for the command (comma-separated)",
+    value: (server.args || []).join(", ")
+  });
+
+  const args = argsInput
+    ? argsInput.split(",").map(arg => arg.trim()).filter(arg => arg.length > 0)
+    : [];
+
+  // Ask for optional working directory
+  const cwd = await vscode.window.showInputBox({
+    prompt: "Working directory (optional)",
+    value: server.cwd || ""
+  });
+
+  // Update server
+  server.command = command.trim();
+  server.args = args.length > 0 ? args : undefined;
+  server.cwd = cwd?.trim() || undefined;
+
+  await saveAndReload(mcpManager, outputChannel, servers, `Updated MCP server "${server.name}"`);
+}
+
+// ── MCP Servers View Provider ─────────────────────────────────────────────────
+
+class McpServersViewProvider implements vscode.WebviewViewProvider {
+  private _view?: vscode.WebviewView;
+  private _extensionUri: vscode.Uri;
+  private _mcpManager: McpManager;
+  private _outputChannel: vscode.OutputChannel;
+
+  constructor(extensionUri: vscode.Uri, mcpManager: McpManager, outputChannel: vscode.OutputChannel) {
+    this._extensionUri = extensionUri;
+    this._mcpManager = mcpManager;
+    this._outputChannel = outputChannel;
+  }
+
+  public resolveWebviewView(
+    webviewView: vscode.WebviewView,
+    _context: vscode.WebviewViewResolveContext,
+    _token: vscode.CancellationToken
+  ): void {
+    this._view = webviewView;
+
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this._extensionUri]
+    };
+
+    this.refreshView();
+
+    webviewView.webview.onDidReceiveMessage(async (msg: { type: string; action?: string; serverName?: string; toolName?: string; enabled?: boolean }) => {
+      if (msg.type === "manageServer" && msg.action && msg.serverName) {
+        await this.manageServer(msg.serverName, msg.action);
+      } else if (msg.type === "addServer") {
+        await addMcpServer(this._mcpManager, this._outputChannel);
+        this.refreshView();
+      } else if (msg.type === "refresh") {
+        await this._mcpManager.loadFromSettings();
+        this.refreshView();
+      } else if (msg.type === "toggleTool" && msg.serverName && msg.toolName && msg.enabled !== undefined) {
+        await this.toggleTool(msg.serverName, msg.toolName, msg.enabled);
+      }
+    });
+  }
+
+  private async toggleTool(serverName: string, toolName: string, enabled: boolean): Promise<void> {
+    await this._mcpManager.toggleTool(serverName, toolName, enabled);
+    const status = enabled ? "enabled" : "disabled";
+    this._outputChannel.appendLine(`[MCP] Tool "${toolName}" on server "${serverName}" ${status}`);
+    this.refreshView();
+  }
+
+  private async manageServer(serverName: string, action: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const servers = config.get<McpServerConfig[]>("mcpServers", []);
+    const server = servers.find(s => s.name === serverName);
+
+    if (!server) {
+      return;
+    }
+
+    if (action === "enable") {
+      server.enabled = true;
+      await this.saveAndReload(servers, `Enabled MCP server "${serverName}"`);
+    } else if (action === "disable") {
+      server.enabled = false;
+      await this.saveAndReload(servers, `Disabled MCP server "${serverName}"`);
+    } else if (action === "remove") {
+      const confirm = await vscode.window.showWarningMessage(
+        `Are you sure you want to remove "${serverName}"?`,
+        "Remove",
+        "Cancel"
+      );
+      if (confirm === "Remove") {
+        const index = servers.indexOf(server);
+        servers.splice(index, 1);
+        await this.saveAndReload(servers, `Removed MCP server "${serverName}"`);
+      }
+    } else if (action === "edit") {
+      await promptAndEditServer(this._mcpManager, this._outputChannel, servers, server);
+    }
+
+    this.refreshView();
+  }
+
+  private async saveAndReload(servers: McpServerConfig[], message: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    try {
+      await config.update("mcpServers", servers, vscode.ConfigurationTarget.Workspace);
+      this._outputChannel.appendLine(`[MCP] ${message}`);
+      await this._mcpManager.loadFromSettings();
+      const toolsCount = this._mcpManager.getAllTools().length;
+      vscode.window.showInformationMessage(
+        `${message}. ${this._mcpManager.connectedCount} server(s) connected with ${toolsCount} tool(s) available.`
+      );
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(`Failed to update MCP server: ${errMessage}`);
+    }
+  }
+
+  private refreshView(): void {
+    if (!this._view) return;
+    
+    const allTools = this._mcpManager.getAllToolsWithStatus();
+    const allServers = this.getServerConfigs();
+    const enabledToolsCount = this._mcpManager.getAllTools().length;
+    
+    this._view.webview.html = this._getWebviewContent(allServers, allTools, enabledToolsCount);
+  }
+
+  private getServerConfigs(): McpServerConfig[] {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    return config.get<McpServerConfig[]>("mcpServers", []);
+  }
+
+  private _getWebviewContent(servers: McpServerConfig[], allTools: Array<{ serverName: string; tool: import("./agent/mcp").McpToolDefinition; enabled: boolean }>, enabledToolsCount: number): string {
+    let serversHtml = "";
+    
+    if (servers.length === 0) {
+      serversHtml = `<div class="empty">No MCP servers configured. Click "Add Server" to add one.</div>`;
+    } else {
+      // Group tools by server
+      const toolsByServer = new Map<string, typeof allTools>();
+      for (const t of allTools) {
+        const existing = toolsByServer.get(t.serverName) || [];
+        existing.push(t);
+        toolsByServer.set(t.serverName, existing);
+      }
+      
+      for (const server of servers) {
+        const statusIcon = server.enabled ? "✅" : "❌";
+        const statusText = server.enabled ? "Connected" : "Disabled";
+        const statusClass = server.enabled ? "status-connected" : "status-disabled";
+        const tools = toolsByServer.get(server.name) || [];
+        
+        // Build tools list
+        let toolsHtml = "";
+        for (const t of tools) {
+          const toggleLabel = t.enabled ? "Disable" : "Enable";
+          toolsHtml += `
+            <div class="tool-item">
+              <span class="tool-name">${t.tool.name}</span>
+              <button class="toggle-btn ${t.enabled ? 'enabled' : ''}" 
+                onclick="vscode.postMessage({ type: 'toggleTool', serverName: '${server.name}', toolName: '${t.tool.name}', enabled: ${!t.enabled} })">
+                ${t.enabled ? '✅ On' : '❌ Off'}
+              </button>
+            </div>`;
+        }
+        
+        if (tools.length === 0 && server.enabled) {
+          toolsHtml = `<div class="no-tools">No tools discovered yet</div>`;
+        } else if (tools.length === 0) {
+          toolsHtml = `<div class="no-tools">Server is disabled</div>`;
+        }
+        
+        serversHtml += `
+          <div class="server-card">
+            <div class="server-header">
+              <span class="server-name">${server.name}</span>
+              <span class="server-status ${statusClass}">${statusIcon} ${statusText}</span>
+            </div>
+            <div class="server-details">
+              <code>${server.command} ${(server.args || []).join(" ")}</code>
+            </div>
+            <div class="tools-section">
+              <div class="tools-header">Tools (${tools.length})</div>
+              <div class="tools-list">
+                ${toolsHtml}
+              </div>
+            </div>
+            <div class="server-actions">
+              ${server.enabled 
+                ? `<button onclick="vscode.postMessage({ type: 'manageServer', action: 'disable', serverName: '${server.name}' })">Disable Server</button>`
+                : `<button onclick="vscode.postMessage({ type: 'manageServer', action: 'enable', serverName: '${server.name}' })">Enable Server</button>`
+              }
+              <button onclick="vscode.postMessage({ type: 'manageServer', action: 'edit', serverName: '${server.name}' })">Edit</button>
+              <button class="danger" onclick="vscode.postMessage({ type: 'manageServer', action: 'remove', serverName: '${server.name}' })">Remove</button>
+            </div>
+          </div>`;
+      }
+    }
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      --bg: var(--vscode-sideBar-background);
+      --fg: var(--vscode-sideBar-foreground);
+      --btn-bg: var(--vscode-button-background);
+      --btn-fg: var(--vscode-button-foreground);
+      --input-bg: var(--vscode-input-background);
+      --input-border: var(--vscode-input-border);
+    }
+    body { margin: 0; padding: 12px; background: var(--bg); color: var(--fg); }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .title { font-size: 16px; font-weight: 600; color: var(--vscode-foreground, #cccccc); }
+    .stats { font-size: 12px; color: var(--vscode-foreground, #cccccc); margin-bottom: 12px; }
+    .btn { padding: 6px 12px; border-radius: 4px; border: none; cursor: pointer; background: var(--btn-bg); color: var(--btn-fg); font-size: 12px; }
+    .btn:hover { opacity: 0.9; }
+    .btn.danger { background: #d32f2f; color: white; }
+    .btn.secondary { background: var(--vscode-button-secondaryBackground); }
+    .server-card { background: var(--vscode-editor-background, #1e1e1e); border: 1px solid var(--vscode-widget-border, #454545); border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+    .server-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .server-name { font-weight: 600; font-size: 14px; }
+    .server-status { font-size: 12px; }
+    .status-connected { color: #4caf50; }
+    .status-disabled { color: #f44336; }
+    .server-details { margin-bottom: 8px; }
+    .server-details code { font-size: 11px; background: var(--vscode-input-background); padding: 4px 8px; border-radius: 4px; }
+    .tools-section { margin: 12px 0; padding-top: 12px; border-top: 1px solid var(--vscode-widget-border, #454545); }
+    .tools-header { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: var(--vscode-foreground, #cccccc); }
+    .tools-list { display: flex; flex-direction: column; gap: 4px; }
+    .tool-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: var(--vscode-input-background); border-radius: 4px; }
+    .tool-name { font-size: 12px; font-family: monospace; }
+    .toggle-btn { padding: 4px 8px; border-radius: 4px; border: none; cursor: pointer; font-size: 11px; background: #666; color: white; }
+    .toggle-btn.enabled { background: #4caf50; }
+    .toggle-btn:hover { opacity: 0.9; }
+    .no-tools { font-size: 11px; color: var(--vscode-foreground, #888); font-style: italic; padding: 4px 0; }
+    .server-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .server-actions button { flex: 1; min-width: 80px; }
+    .empty { text-align: center; padding: 24px; color: var(--vscode-foreground, #cccccc); }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">MCP Servers</span>
+    <div>
+      <button class="btn secondary" onclick="vscode.postMessage({ type: 'refresh' })">↻</button>
+      <button class="btn" onclick="vscode.postMessage({ type: 'addServer' })">+ Add Server</button>
+    </div>
+  </div>
+  <div class="stats">${servers.length} server(s) • ${enabledToolsCount} tool(s) enabled</div>
+  <div class="servers">
+    ${serversHtml}
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+  </script>
+</body>
+</html>`;
+  }
 }
 
 // ── WebviewViewProvider for sidebar chat ─────────────────────────────────────

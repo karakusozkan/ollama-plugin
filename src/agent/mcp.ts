@@ -392,9 +392,47 @@ export class McpClient {
 export class McpManager {
   private clients = new Map<string, McpClient>();
   private _outputChannel: vscode.OutputChannel | null = null;
+  private _disabledTools = new Set<string>(); // Format: "serverName:toolName"
 
   set outputChannel(channel: vscode.OutputChannel) {
     this._outputChannel = channel;
+  }
+
+  /**
+   * Load disabled tools from VS Code settings
+   */
+  private async loadDisabledTools(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const disabled = config.get<string[]>("mcpDisabledTools", []);
+    this._disabledTools = new Set(disabled);
+  }
+
+  /**
+   * Save disabled tools to VS Code settings
+   */
+  private async saveDisabledTools(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    await config.update("mcpDisabledTools", Array.from(this._disabledTools), vscode.ConfigurationTarget.Workspace);
+  }
+
+  /**
+   * Check if a specific tool is disabled
+   */
+  isToolDisabled(serverName: string, toolName: string): boolean {
+    return this._disabledTools.has(`${serverName}:${toolName}`);
+  }
+
+  /**
+   * Toggle a tool on/off
+   */
+  async toggleTool(serverName: string, toolName: string, enabled: boolean): Promise<void> {
+    const key = `${serverName}:${toolName}`;
+    if (enabled) {
+      this._disabledTools.delete(key);
+    } else {
+      this._disabledTools.add(key);
+    }
+    await this.saveDisabledTools();
   }
 
   private log(message: string): void {
@@ -408,6 +446,9 @@ export class McpManager {
    * Load MCP server configurations from VS Code settings and connect to them.
    */
   async loadFromSettings(): Promise<void> {
+    // Load disabled tools first
+    await this.loadDisabledTools();
+    
     const config = vscode.workspace.getConfiguration("ollamaAgent");
     const servers = config.get<McpServerConfig[]>("mcpServers", []);
 
@@ -437,13 +478,32 @@ export class McpManager {
   /**
    * Get all available MCP tools across all connected servers.
    * Returns tools prefixed with the server name for disambiguation.
+   * Does not include disabled tools.
    */
   getAllTools(): Array<{ serverName: string; tool: McpToolDefinition }> {
     const allTools: Array<{ serverName: string; tool: McpToolDefinition }> = [];
     for (const [serverName, client] of this.clients) {
       if (client.connected) {
         for (const tool of client.tools) {
-          allTools.push({ serverName, tool });
+          if (!this.isToolDisabled(serverName, tool.name)) {
+            allTools.push({ serverName, tool });
+          }
+        }
+      }
+    }
+    return allTools;
+  }
+
+  /**
+   * Get all tools including disabled ones with their status
+   */
+  getAllToolsWithStatus(): Array<{ serverName: string; tool: McpToolDefinition; enabled: boolean }> {
+    const allTools: Array<{ serverName: string; tool: McpToolDefinition; enabled: boolean }> = [];
+    for (const [serverName, client] of this.clients) {
+      if (client.connected) {
+        for (const tool of client.tools) {
+          const enabled = !this.isToolDisabled(serverName, tool.name);
+          allTools.push({ serverName, tool, enabled });
         }
       }
     }
