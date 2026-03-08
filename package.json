@@ -1,9 +1,13 @@
 {
-	"name": "ollama-agent",
-	"displayName": "Ollama Agent",
+	"name": "ollama-agentz",
+	"displayName": "Ollama agentz",
 	"description": "An AI coding agent powered by Ollama running locally",
-	"version": "0.0.1",
-	"publisher": "ollama-agent",
+	"version": "0.0.2",
+	"publisher": "ollama-agentz",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/karakusozkan/ollama-plugin"
+	},
 	"engines": {
 		"vscode": "^1.85.0"
 	},

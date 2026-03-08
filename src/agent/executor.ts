@@ -359,7 +359,9 @@ async function openOrCreate(uri: vscode.Uri): Promise<vscode.TextDocument> {
 
 /**
  * Fetch content from a URL using Node.js native http/https modules.
- * Returns the response body as a string (limited to 500KB).
+ * Returns the response body as a string. Large responses are gracefully
+ * truncated at 2MB of raw HTML (the parsed text is further trimmed to 50KB
+ * by parseHtmlToText).
  */
 function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -367,6 +369,15 @@ function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): P
 			reject(new Error("Operation cancelled by user."));
 			return;
 		}
+
+		let settled = false;
+		const settle = (fn: typeof resolve | typeof reject, value: string | Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			abortSignal?.removeEventListener("abort", abortHandler);
+			(fn as any)(value);
+		};
 
 		const parsedUrl = new URL(url);
 		const isHttps = parsedUrl.protocol === "https:";
@@ -384,13 +395,12 @@ function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): P
 			},
 		};
 
-		const timeout = setTimeout(() => {
+		const timer = setTimeout(() => {
 			req.destroy(new Error("Request timeout"));
 		}, timeoutMs);
 
 		// Handle abort signal
 		const abortHandler = () => {
-			clearTimeout(timeout);
 			req.destroy(new Error("Operation cancelled by user."));
 		};
 		abortSignal?.addEventListener("abort", abortHandler);
@@ -398,7 +408,7 @@ function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): P
 		const req = client.request(options, (res) => {
 			// Handle redirects
 			if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-				clearTimeout(timeout);
+				clearTimeout(timer);
 				abortSignal?.removeEventListener("abort", abortHandler);
 				const redirectUrl = res.headers.location;
 				// Handle relative redirects
@@ -412,50 +422,75 @@ function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): P
 			}
 
 			if (res.statusCode && res.statusCode >= 400) {
-				clearTimeout(timeout);
-				abortSignal?.removeEventListener("abort", abortHandler);
 				// For 401/403/paywall, provide a helpful message instead of throwing
 				if (res.statusCode === 401 || res.statusCode === 403) {
-					reject(new Error(`HTTP ${res.statusCode}: Access denied (paywall or authentication required)`));
+					settle(reject as any, new Error(`HTTP ${res.statusCode}: Access denied (paywall or authentication required)`));
 				} else {
-					reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+					settle(reject as any, new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
 				}
 				return;
 			}
 
 			const chunks: Buffer[] = [];
 			let totalSize = 0;
-			const maxSize = 500 * 1024; // 500KB limit
+			let truncated = false;
+			const maxSize = 2 * 1024 * 1024; // 2MB raw limit (parsed text is further trimmed)
 
 			res.on("data", (chunk: Buffer) => {
+				if (truncated) {
+					return; // Already have enough data, ignore the rest
+				}
 				totalSize += chunk.length;
 				if (totalSize > maxSize) {
-					clearTimeout(timeout);
-					abortSignal?.removeEventListener("abort", abortHandler);
-					req.destroy(new Error("Response too large (max 500KB)"));
+					// Keep only the portion that fits within the limit
+					const overshoot = totalSize - maxSize;
+					const trimmedChunk = chunk.slice(0, chunk.length - overshoot);
+					if (trimmedChunk.length > 0) {
+						chunks.push(trimmedChunk);
+					}
+					truncated = true;
+					// Destroy the response stream to stop downloading
+					res.destroy();
 					return;
 				}
 				chunks.push(chunk);
 			});
 
 			res.on("end", () => {
-				clearTimeout(timeout);
-				abortSignal?.removeEventListener("abort", abortHandler);
 				const buffer = Buffer.concat(chunks);
-				resolve(buffer.toString("utf-8"));
+				let text = buffer.toString("utf-8");
+				if (truncated) {
+					text += "\n<!-- [Content truncated: page exceeded 2MB raw size] -->";
+				}
+				settle(resolve, text);
+			});
+
+			res.on("close", () => {
+				// Handle 'close' for when we destroy the stream early (truncation)
+				if (truncated) {
+					const buffer = Buffer.concat(chunks);
+					let text = buffer.toString("utf-8");
+					text += "\n<!-- [Content truncated: page exceeded 2MB raw size] -->";
+					settle(resolve, text);
+				}
 			});
 
 			res.on("error", (err) => {
-				clearTimeout(timeout);
-				abortSignal?.removeEventListener("abort", abortHandler);
-				reject(err);
+				// If we already collected data before the error (e.g. from truncation destroy),
+				// resolve with what we have instead of rejecting
+				if (truncated && chunks.length > 0) {
+					const buffer = Buffer.concat(chunks);
+					let text = buffer.toString("utf-8");
+					text += "\n<!-- [Content truncated: page exceeded 2MB raw size] -->";
+					settle(resolve, text);
+				} else {
+					settle(reject as any, err);
+				}
 			});
 		});
 
 		req.on("error", (err) => {
-			clearTimeout(timeout);
-			abortSignal?.removeEventListener("abort", abortHandler);
-			reject(err);
+			settle(reject as any, err);
 		});
 
 		req.end();
@@ -465,7 +500,7 @@ function fetchUrl(url: string, timeoutMs = 30_000, abortSignal?: AbortSignal): P
 /**
  * Parse HTML content and extract readable text.
  * Strips HTML tags, scripts, styles, and normalizes whitespace.
- * Returns clean readable text limited to 50KB.
+ * Returns clean readable text limited to 100KB.
  */
 function parseHtmlToText(html: string): string {
 	// Remove script and style blocks entirely
@@ -503,10 +538,10 @@ function parseHtmlToText(html: string): string {
 	// Collapse multiple consecutive blank lines
 	text = text.replace(/\n{3,}/g, "\n\n");
 
-	// Limit output size to 50KB
-	const maxBytes = 50 * 1024;
+	// Limit output size to 100KB
+	const maxBytes = 100 * 1024;
 	if (text.length > maxBytes) {
-		text = text.slice(0, maxBytes) + "\n\n[Content truncated at 50KB]";
+		text = text.slice(0, maxBytes) + "\n\n[Content truncated at 100KB]";
 	}
 
 	return text.trim();

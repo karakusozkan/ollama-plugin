@@ -135,7 +135,7 @@ and you can execute shell commands in the workspace root directory.
 | edit_file     | path, content     | Overwrite an existing file with full new content                   |
 | delete_file   | path              | Delete a file (moves to OS trash)                                  |
 | run_command   | command           | Run a shell command in the workspace root directory                |
-| fetch_url     | url               | Fetch a URL and return its content as clean readable text          |
+| fetch_url     | url               | Fetch a URL and return its content as clean readable text (large pages are automatically truncated) |
 
 ${os.commandGuidance}
 
