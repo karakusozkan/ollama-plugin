@@ -7,6 +7,7 @@
  */
 
 import * as cp from "child_process";
+import * as net from "net";
 import * as vscode from "vscode";
 
 // ── MCP Protocol Types ──────────────────────────────────────────────────────
@@ -45,6 +46,32 @@ export interface McpToolDefinition {
   };
 }
 
+export interface McpServerSummary {
+  name: string;
+  enabled: boolean;
+  connected: boolean;
+  transport: "stdio" | "tcp";
+  command?: string;
+  args?: string[];
+  host?: string;
+  port?: number;
+  toolCount: number;
+}
+
+export interface McpToolSummary {
+  serverName: string;
+  name: string;
+  enabled: boolean;
+  description?: string;
+  required?: string[];
+  properties?: Array<{
+    name: string;
+    type?: string;
+    description?: string;
+    enum?: string[];
+  }>;
+}
+
 /** JSON Schema property descriptor for tool parameters */
 export interface McpToolPropertySchema {
   type?: string;
@@ -80,6 +107,17 @@ export interface McpServerConfig {
   cwd?: string;
   /** Whether this server is enabled (default: true) */
   enabled?: boolean;
+  /** Transport type: 'stdio' to spawn a process, or 'tcp' to connect to host:port */
+  transport?: "stdio" | "tcp";
+  /** TCP host (when transport === 'tcp') */
+  host?: string;
+  /** TCP port (when transport === 'tcp') */
+  port?: number;
+  /** Optional per-server request timeout in milliseconds (defaults to 30000) */
+  timeoutMs?: number;
+  /** Timeout for the initial connect/handshake in milliseconds (defaults to 120000).
+   *  Set higher for servers that need to download packages on first run (e.g. npx -y …). */
+  connectTimeoutMs?: number;
 }
 
 // ── MCP Client ──────────────────────────────────────────────────────────────
@@ -101,10 +139,12 @@ export class McpClient {
   private _connected = false;
   private _serverName: string;
   private _config: McpServerConfig;
+  private _outputChannel: vscode.OutputChannel | null = null;
 
-  constructor(config: McpServerConfig) {
+  constructor(config: McpServerConfig, outputChannel?: vscode.OutputChannel | null) {
     this._config = config;
     this._serverName = config.name;
+    this._outputChannel = outputChannel || null;
   }
 
   get serverName(): string {
@@ -130,12 +170,14 @@ export class McpClient {
     const env = { ...process.env, ...(this._config.env || {}) };
     const cwd = this._config.cwd || workspaceRoot() || process.cwd();
 
-    try {
+      try {
       this.process = cp.spawn(this._config.command, this._config.args || [], {
         cwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        // Use a shell on Windows so commands like `npx` resolve correctly
+        shell: process.platform === "win32",
       });
     } catch (err) {
       throw new Error(
@@ -156,12 +198,16 @@ export class McpClient {
     this.process.stderr?.on("data", (data: Buffer) => {
       const text = data.toString("utf-8").trim();
       if (text) {
-        console.log(`[MCP:${this._serverName}:stderr] ${text}`);
+        const line = `[MCP:${this._serverName}:stderr] ${text}`;
+        try { this._outputChannel?.appendLine(line); } catch {}
+        try { console.log(line); } catch {}
       }
     });
 
     this.process.on("error", (err) => {
-      console.error(`[MCP:${this._serverName}] Process error:`, err.message);
+      const line = `[MCP:${this._serverName}] Process error: ${err.message}`;
+      try { this._outputChannel?.appendLine(line); } catch {}
+      try { console.error(line); } catch {}
       this._connected = false;
       // Reject all pending requests
       for (const [, pending] of this.pendingRequests) {
@@ -171,7 +217,9 @@ export class McpClient {
     });
 
     this.process.on("close", (code) => {
-      console.log(`[MCP:${this._serverName}] Process exited with code ${code}`);
+      const line = `[MCP:${this._serverName}] Process exited with code ${code}`;
+      try { this._outputChannel?.appendLine(line); } catch {}
+      try { console.log(line); } catch {}
       this._connected = false;
       // Reject all pending requests
       for (const [, pending] of this.pendingRequests) {
@@ -180,7 +228,11 @@ export class McpClient {
       this.pendingRequests.clear();
     });
 
-    // Perform MCP initialization handshake
+    // Perform MCP initialization handshake.
+    // Use a longer timeout here — npx -y may need to download the package on first run
+    // which can take a minute or more on a slow connection.
+    const savedTimeoutMs = this._config.timeoutMs;
+    this._config = { ...this._config, timeoutMs: this._config.connectTimeoutMs ?? 120_000 };
     try {
       const initResult = await this.sendRequest("initialize", {
         protocolVersion: "2024-11-05",
@@ -191,16 +243,20 @@ export class McpClient {
         },
       }) as { protocolVersion: string; capabilities: Record<string, unknown>; serverInfo?: { name: string; version?: string } };
 
-      console.log(`[MCP:${this._serverName}] Initialized:`, JSON.stringify(initResult));
+      try { this._outputChannel?.appendLine(`[MCP:${this._serverName}] Initialized: ${JSON.stringify(initResult)}`); } catch {}
+      try { console.log(`[MCP:${this._serverName}] Initialized:`, JSON.stringify(initResult)); } catch {}
 
       // Send initialized notification
       this.sendNotification("notifications/initialized", {});
 
       this._connected = true;
+      // Restore the normal per-request timeout now that we are connected.
+      this._config = { ...this._config, timeoutMs: savedTimeoutMs };
 
       // Discover available tools
       await this.refreshTools();
     } catch (err) {
+      this._config = { ...this._config, timeoutMs: savedTimeoutMs };
       this.disconnect();
       throw new Error(
         `Failed to initialize MCP server "${this._serverName}": ${err instanceof Error ? err.message : String(err)}`
@@ -210,19 +266,30 @@ export class McpClient {
 
   /**
    * Refresh the list of available tools from the server.
+   * Follows nextCursor pagination to collect all available tools.
    */
   async refreshTools(): Promise<McpToolDefinition[]> {
     if (!this._connected) {
       throw new Error(`MCP server "${this._serverName}" is not connected.`);
     }
 
-    const result = await this.sendRequest("tools/list", {}) as {
-      tools: McpToolDefinition[];
-    };
+    const allTools: McpToolDefinition[] = [];
+    let cursor: string | undefined;
 
-    this._tools = result.tools || [];
-    console.log(`[MCP:${this._serverName}] Discovered ${this._tools.length} tools:`,
-      this._tools.map(t => t.name).join(", "));
+    do {
+      const params: Record<string, unknown> = cursor ? { cursor } : {};
+      const result = await this.sendRequest("tools/list", params) as {
+        tools?: McpToolDefinition[];
+        nextCursor?: string;
+      };
+      allTools.push(...(result.tools || []));
+      cursor = result.nextCursor;
+    } while (cursor);
+
+    this._tools = allTools;
+    const line = `[MCP:${this._serverName}] Discovered ${this._tools.length} tools: ${this._tools.map(t => t.name).join(", ")}`;
+    try { this._outputChannel?.appendLine(line); } catch {}
+    try { console.log(line); } catch {}
 
     return this._tools;
   }
@@ -349,13 +416,14 @@ export class McpClient {
         ));
       }
 
-      // Timeout after 30 seconds
+      // Timeout (configurable per-server, default 30s)
+      const timeoutMs = this._config.timeoutMs ?? 30_000;
       setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           reject(new Error(`MCP request to "${this._serverName}" timed out (method: ${method})`));
         }
-      }, 30_000);
+      }, timeoutMs);
     });
   }
 
@@ -382,6 +450,185 @@ export class McpClient {
   }
 }
 
+/**
+ * MCP client that connects to an already-running MCP server over TCP.
+ * Useful when the server is started externally (e.g. Playwright MCP server).
+ */
+export class TcpMcpClient {
+  private socket: net.Socket | null = null;
+  private nextId = 1;
+  private pendingRequests = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (reason: Error) => void;
+  }>();
+  private buffer = "";
+  private _tools: McpToolDefinition[] = [];
+  private _connected = false;
+  private _serverName: string;
+  private _config: McpServerConfig;
+  private _outputChannel: vscode.OutputChannel | null = null;
+
+  constructor(config: McpServerConfig, outputChannel?: vscode.OutputChannel | null) {
+    this._config = config;
+    this._serverName = config.name;
+    this._outputChannel = outputChannel || null;
+  }
+
+  get serverName(): string { return this._serverName; }
+  get connected(): boolean { return this._connected; }
+  get tools(): McpToolDefinition[] { return this._tools; }
+
+  async connect(): Promise<void> {
+    if (this._connected) return;
+
+    const host = this._config.host || "127.0.0.1";
+    const port = this._config.port;
+    if (!port) {
+      throw new Error(`MCP server "${this._serverName}" tcp port not specified.`);
+    }
+
+    this.socket = new net.Socket();
+
+    return new Promise((resolve, reject) => {
+      const onError = (err: Error) => {
+        this._connected = false;
+        reject(new Error(`Failed to connect to MCP server "${this._serverName}" at ${host}:${port}: ${err.message}`));
+      };
+
+      this.socket!.once("error", onError);
+
+      this.socket!.connect(port, host, async () => {
+        this.socket!.removeListener("error", onError);
+
+        this.socket!.on("data", (data: Buffer) => this.handleData(data.toString("utf-8")));
+        this.socket!.on("close", () => {
+          const line = `[MCP:${this._serverName}] TCP socket closed`;
+          try { this._outputChannel?.appendLine(line); } catch {}
+          try { console.log(line); } catch {}
+          this._connected = false;
+        });
+
+        const savedConnectTimeoutMs = this._config.timeoutMs;
+        this._config = { ...this._config, timeoutMs: this._config.connectTimeoutMs ?? 120_000 };
+        try {
+          const initResult = await this.sendRequest("initialize", {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "ollama-agent-vscode", version: "0.0.1" }
+          }) as { protocolVersion: string };
+
+          this.sendNotification("notifications/initialized", {});
+          this._connected = true;
+          this._config = { ...this._config, timeoutMs: savedConnectTimeoutMs };
+          try { this._outputChannel?.appendLine(`[MCP:${this._serverName}] Initialized (tcp)`); } catch {}
+          await this.refreshTools();
+          resolve();
+        } catch (err) {
+          this._config = { ...this._config, timeoutMs: savedConnectTimeoutMs };
+          this.disconnect();
+          reject(new Error(`Failed to initialize MCP server "${this._serverName}": ${err instanceof Error ? err.message : String(err)}`));
+        }
+      });
+    });
+  }
+
+  async refreshTools(): Promise<McpToolDefinition[]> {
+    if (!this._connected) throw new Error(`MCP server "${this._serverName}" is not connected.`);
+    const allTools: McpToolDefinition[] = [];
+    let cursor: string | undefined;
+    do {
+      const params: Record<string, unknown> = cursor ? { cursor } : {};
+      const result = await this.sendRequest("tools/list", params) as { tools?: McpToolDefinition[]; nextCursor?: string };
+      allTools.push(...(result.tools || []));
+      cursor = result.nextCursor;
+    } while (cursor);
+    this._tools = allTools;
+    return this._tools;
+  }
+
+  async callTool(toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+    if (!this._connected) throw new Error(`MCP server "${this._serverName}" is not connected.`);
+    const result = await this.sendRequest("tools/call", { name: toolName, arguments: args }) as McpToolCallResult;
+    return result;
+  }
+
+  disconnect(): void {
+    this._connected = false;
+    this._tools = [];
+    if (this.socket) {
+      try { this.socket.end(); this.socket.destroy(); } catch {}
+      this.socket = null;
+    }
+    for (const [, pending] of this.pendingRequests) {
+      pending.reject(new Error(`MCP server "${this._serverName}" disconnected.`));
+    }
+    this.pendingRequests.clear();
+  }
+
+  private handleData(data: string): void {
+    this.buffer += data;
+    let newlineIndex: number;
+    while ((newlineIndex = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.slice(0, newlineIndex).trim();
+      this.buffer = this.buffer.slice(newlineIndex + 1);
+      if (!line) continue;
+      try {
+        const message = JSON.parse(line) as JsonRpcResponse | JsonRpcNotification;
+        if ("id" in message && message.id !== undefined) {
+          const response = message as JsonRpcResponse;
+          const pending = this.pendingRequests.get(response.id);
+          if (pending) {
+            this.pendingRequests.delete(response.id);
+            if (response.error) {
+              pending.reject(new Error(`MCP error ${response.error.code}: ${response.error.message}`));
+            } else {
+              pending.resolve(response.result);
+            }
+          }
+        } else {
+          // notification
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private sendRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      if (!this.socket) { reject(new Error(`MCP server "${this._serverName}" socket not available.`)); return; }
+      const id = this.nextId++;
+      const request: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
+      this.pendingRequests.set(id, { resolve, reject });
+      const message = JSON.stringify(request) + "\n";
+      try {
+        this.socket.write(message, "utf-8", (err) => {
+          if (err) {
+            this.pendingRequests.delete(id);
+            reject(new Error(`Failed to write to MCP server "${this._serverName}": ${err.message}`));
+          }
+        });
+      } catch (err) {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Failed to send to MCP server "${this._serverName}": ${err instanceof Error ? err.message : String(err)}`));
+      }
+      const timeoutMs = this._config.timeoutMs ?? 30_000;
+      setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          reject(new Error(`MCP request to "${this._serverName}" timed out (method: ${method})`));
+        }
+      }, timeoutMs);
+    });
+  }
+
+  private sendNotification(method: string, params: Record<string, unknown>): void {
+    if (!this.socket) return;
+    const notification: JsonRpcNotification = { jsonrpc: "2.0", method, params };
+    try { this.socket.write(JSON.stringify(notification) + "\n", "utf-8"); } catch {}
+  }
+}
+
 // ── MCP Manager ─────────────────────────────────────────────────────────────
 
 /**
@@ -390,9 +637,13 @@ export class McpClient {
  * a unified interface for tool discovery and execution.
  */
 export class McpManager {
-  private clients = new Map<string, McpClient>();
+  private clients = new Map<string, any>();
   private _outputChannel: vscode.OutputChannel | null = null;
   private _disabledTools = new Set<string>(); // Format: "serverName:toolName"
+
+  private readonly _onDidLoad = new vscode.EventEmitter<void>();
+  /** Fires each time `loadFromSettings()` completes (success or error). */
+  public readonly onDidLoad: vscode.Event<void> = this._onDidLoad.event;
 
   set outputChannel(channel: vscode.OutputChannel) {
     this._outputChannel = channel;
@@ -462,17 +713,59 @@ export class McpManager {
       }
 
       try {
-        this.log(`Connecting to MCP server: ${serverConfig.name} (${serverConfig.command} ${(serverConfig.args || []).join(" ")})`);
-        const client = new McpClient(serverConfig);
-        await client.connect();
-        this.clients.set(serverConfig.name, client);
-        this.log(`✅ Connected to "${serverConfig.name}" — ${client.tools.length} tool(s) available: ${client.tools.map(t => t.name).join(", ")}`);
+        if (serverConfig.transport === "tcp") {
+          this.log(`Connecting to MCP server (tcp): ${serverConfig.name} (${serverConfig.host || '127.0.0.1'}:${serverConfig.port})`);
+          const client = new TcpMcpClient(serverConfig, this._outputChannel);
+          await client.connect();
+          this.clients.set(serverConfig.name, client as any);
+          this.log(`✅ Connected to "${serverConfig.name}" — ${client.tools.length} tool(s) available: ${client.tools.map(t => t.name).join(", ")}`);
+        } else {
+          this.log(`Connecting to MCP server: ${serverConfig.name} (${serverConfig.command} ${(serverConfig.args || []).join(" ")})`);
+          const client = new McpClient(serverConfig, this._outputChannel);
+          await client.connect();
+          this.clients.set(serverConfig.name, client as any);
+          this.log(`✅ Connected to "${serverConfig.name}" — ${client.tools.length} tool(s) available: ${client.tools.map(t => t.name).join(", ")}`);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.log(`❌ Failed to connect to "${serverConfig.name}": ${message}`);
+        // Helpful Windows fallback: if spawn npx ENOENT, retry with npx.cmd or via cmd /c
+        if (process.platform === "win32" && serverConfig.transport !== "tcp") {
+          const isNpx = serverConfig.command === "npx" || serverConfig.command === "npx.cmd";
+          if (isNpx && /spawn npx ENOENT/i.test(message)) {
+            try {
+              this.log(`Attempting Windows fallback: retrying with npx.cmd for "${serverConfig.name}"`);
+              const fixed = { ...serverConfig, command: "npx.cmd" } as McpServerConfig;
+              const client2 = new McpClient(fixed, this._outputChannel);
+              await client2.connect();
+              this.clients.set(serverConfig.name, client2 as any);
+              this.log(`✅ Connected to "${serverConfig.name}" via npx.cmd — ${client2.tools.length} tool(s) available`);
+              continue;
+            } catch (err2) {
+              const msg2 = err2 instanceof Error ? err2.message : String(err2);
+              this.log(`Windows fallback npx.cmd also failed: ${msg2}`);
+            }
+            // Try shelling through cmd /c as a last resort
+            try {
+              this.log(`Attempting Windows fallback: running via cmd /c for "${serverConfig.name}"`);
+              const joined = [serverConfig.command].concat(serverConfig.args || []).join(" ");
+              const shellCfg: McpServerConfig = { ...serverConfig, command: "cmd", args: ["/c", joined] };
+              const client3 = new McpClient(shellCfg, this._outputChannel);
+              await client3.connect();
+              this.clients.set(serverConfig.name, client3 as any);
+              this.log(`✅ Connected to "${serverConfig.name}" via cmd /c — ${client3.tools.length} tool(s) available`);
+              continue;
+            } catch (err3) {
+              this.log(`Windows fallback cmd /c failed: ${err3 instanceof Error ? err3.message : String(err3)}`);
+            }
+          }
+        }
         vscode.window.showWarningMessage(`MCP server "${serverConfig.name}" failed to connect: ${message}`);
       }
     }
+
+    // Notify subscribers that loading is complete (whether or not all servers connected).
+    this._onDidLoad.fire();
   }
 
   /**
@@ -510,6 +803,55 @@ export class McpManager {
     return allTools;
   }
 
+  getServerSummaries(): McpServerSummary[] {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const servers = config.get<McpServerConfig[]>("mcpServers", []);
+
+    return servers.map((server) => {
+      const client = this.clients.get(server.name);
+      const connected = client?.connected === true;
+      const toolCount = connected && Array.isArray(client?.tools) ? client.tools.length : 0;
+
+      return {
+        name: server.name,
+        enabled: server.enabled !== false,
+        connected,
+        transport: server.transport === "tcp" ? "tcp" : "stdio",
+        command: server.command,
+        args: server.args,
+        host: server.host,
+        port: server.port,
+        toolCount,
+      };
+    });
+  }
+
+  getToolSummaries(serverName?: string, includeDisabled = false): McpToolSummary[] {
+    const tools = includeDisabled ? this.getAllToolsWithStatus() : this.getAllTools().map((entry) => ({ ...entry, enabled: true }));
+
+    return tools
+      .filter((entry) => !serverName || entry.serverName === serverName)
+      .map((entry) => {
+        const properties = Object.entries(entry.tool.inputSchema?.properties || {}).map(([name, schema]) => ({
+          name,
+          type: typeof schema.type === "string" ? schema.type : undefined,
+          description: typeof schema.description === "string" ? schema.description : undefined,
+          enum: Array.isArray(schema.enum)
+            ? schema.enum.filter((value): value is string => typeof value === "string")
+            : undefined,
+        }));
+
+        return {
+          serverName: entry.serverName,
+          name: entry.tool.name,
+          enabled: entry.enabled,
+          description: entry.tool.description,
+          required: Array.isArray(entry.tool.inputSchema?.required) ? entry.tool.inputSchema.required : [],
+          properties,
+        };
+      });
+  }
+
   /**
    * Call a tool on a specific MCP server.
    */
@@ -525,13 +867,28 @@ export class McpManager {
   }
 
   /**
+   * Fetch raw tools list from a specific server (useful for debugging).
+   */
+  async fetchToolsRaw(serverName: string): Promise<McpToolDefinition[] | undefined> {
+    const client = this.clients.get(serverName);
+    if (!client) {
+      throw new Error(`MCP server "${serverName}" not found.`);
+    }
+    if (!client.connected) {
+      throw new Error(`MCP server "${serverName}" is not connected.`);
+    }
+    // client.refreshTools returns the tools array
+    return (await client.refreshTools()) as McpToolDefinition[];
+  }
+
+  /**
    * Find which server provides a given tool name.
    * If multiple servers provide the same tool name, returns the first match.
    */
   findToolServer(toolName: string): { serverName: string; tool: McpToolDefinition } | undefined {
     for (const [serverName, client] of this.clients) {
       if (client.connected) {
-        const tool = client.tools.find(t => t.name === toolName);
+        const tool = client.tools.find((t: McpToolDefinition) => t.name === toolName);
         if (tool) {
           return { serverName, tool };
         }
@@ -565,6 +922,14 @@ export class McpManager {
   }
 
   /**
+   * Returns true if the named server has an active connection.
+   */
+  isServerConnected(serverName: string): boolean {
+    const client = this.clients.get(serverName);
+    return client !== undefined && client.connected === true;
+  }
+
+  /**
    * Build a description of all available MCP tools for inclusion in the system prompt.
    * Returns an empty string if no MCP tools are available.
    */
@@ -577,12 +942,11 @@ export class McpManager {
     const lines: string[] = [
       "",
       "## MCP Server Tools",
-      "The following additional tools are available from connected MCP servers.",
       'Use them with the "mcp_tool" action type.',
+      '{ "tool": "mcp_tool", "server": "<server_name>", "name": "<tool_name>", "arguments": { ... } }',
       "",
     ];
 
-    // Group tools by server
     const byServer = new Map<string, Array<{ tool: McpToolDefinition }>>();
     for (const entry of allTools) {
       const existing = byServer.get(entry.serverName) || [];
@@ -591,33 +955,24 @@ export class McpManager {
     }
 
     for (const [serverName, tools] of byServer) {
-      lines.push(`### Server: ${serverName}`);
+      lines.push(`Server ${serverName}:`);
       for (const { tool } of tools) {
-        lines.push(`- **${tool.name}**: ${tool.description || "(no description)"}`);
-        if (tool.inputSchema?.properties) {
-          const props = tool.inputSchema.properties;
-          const required = new Set(tool.inputSchema.required || []);
-          const paramLines: string[] = [];
-          for (const [propName, propSchema] of Object.entries(props)) {
-            const req = required.has(propName) ? " (required)" : " (optional)";
-            const desc = propSchema.description || "";
-            const type = propSchema.type || "any";
-            paramLines.push(`    - \`${propName}\` (${type}${req}): ${desc}`);
-          }
-          if (paramLines.length > 0) {
-            lines.push("  Parameters:");
-            lines.push(...paramLines);
-          }
+        const requiredProps = Array.isArray(tool.inputSchema?.required)
+          ? tool.inputSchema.required.join(", ")
+          : "";
+        const propNames = tool.inputSchema?.properties
+          ? Object.keys(tool.inputSchema.properties).slice(0, 6).join(", ")
+          : "";
+        const details = [requiredProps ? `required: ${requiredProps}` : "", propNames ? `args: ${propNames}` : ""]
+          .filter(Boolean)
+          .join("; ");
+        lines.push(`- ${tool.name}${details ? ` (${details})` : ""}`);
+        if (tool.description) {
+          lines.push(`  ${tool.description}`);
         }
       }
       lines.push("");
     }
-
-    lines.push('To call an MCP tool, use this action format:');
-    lines.push('```');
-    lines.push('{ "tool": "mcp_tool", "server": "<server_name>", "name": "<tool_name>", "arguments": { ... } }');
-    lines.push('```');
-    lines.push("");
 
     return lines.join("\n");
   }

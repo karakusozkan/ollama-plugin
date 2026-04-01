@@ -90,17 +90,56 @@ export class Agent {
     this._mcpManager = manager;
   }
 
-  async run(goal: string, output: vscode.OutputChannel): Promise<void> {
+  async run(goal: string, output: vscode.OutputChannel, abortSignal?: AbortSignal): Promise<void> {
     const messages: Message[] = [
       { role: "system", content: buildSystemPrompt(this._mcpManager) },
       { role: "user", content: goal },
     ];
 
+    let lastActionsIncludedFetch = false;
+    let fetchExtractionRetryUsed = false;
+
     for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
       output.appendLine(`\n── Iteration ${iteration} ──────────────────────`);
       output.appendLine("⏳ Waiting for LLM…");
 
-      const raw = await this.llm.chat(messages);
+      if (abortSignal?.aborted) {
+        output.appendLine("⏹ Agent run cancelled.");
+        return;
+      }
+
+      let raw = "";
+      const useStreaming = vscode.workspace.getConfiguration("ollamaAgent").get<boolean>("useStreaming", true);
+
+      if (useStreaming) {
+        try {
+          raw = await this.llm.chatStream(messages, () => {
+            // The Run command writes parsed thoughts/actions to the output channel,
+            // so there is no need to print raw token chunks here.
+          }, undefined, abortSignal);
+        } catch (streamErr) {
+          if (abortSignal?.aborted) {
+            output.appendLine("⏹ Agent run cancelled.");
+            return;
+          }
+          const message = streamErr instanceof Error ? streamErr.message : String(streamErr);
+          output.appendLine(`ℹ️ Streaming failed or stalled; retrying without streaming. ${message}`);
+          raw = await this.llm.chat(messages, undefined, abortSignal);
+        }
+      } else {
+        output.appendLine("ℹ️ Streaming disabled; using non-streaming chat request.");
+        raw = await this.llm.chat(messages, undefined, abortSignal);
+      }
+
+      if (abortSignal?.aborted) {
+        output.appendLine("⏹ Agent run cancelled.");
+        return;
+      }
+
+      if (!raw.trim()) {
+        output.appendLine("ℹ️ Empty response received; retrying once without streaming.");
+        raw = await this.llm.chat(messages, undefined, abortSignal);
+      }
 
       let parsed: AgentResponse;
       try {
@@ -114,6 +153,21 @@ export class Agent {
       output.appendLine(`💭 ${parsed.thought}`);
 
       if (!parsed.actions || parsed.actions.length === 0) {
+        // If the model returned no actions immediately after we executed a fetch_url,
+        // it may have failed to produce the final extraction. Give it one retry with
+        // a short clarifying prompt so it can extract the fetched page text. Only
+        // retry once to avoid infinite loops.
+        if (lastActionsIncludedFetch && !fetchExtractionRetryUsed) {
+          fetchExtractionRetryUsed = true;
+          output.appendLine("ℹ️ No actions returned after fetch — asking model to extract fetched content and retrying once.");
+          // Push the assistant's raw response so the model has its last turn, then
+          // add a concise user instruction to extract the first news article.
+          messages.push({ role: "assistant", content: raw });
+          messages.push({ role: "user", content: "Please extract the first news article from the previously fetched page text and return the full article text inside the \"thought\" field. Do not call any tools; return an empty \"actions\" array when finished." });
+          // Continue to next iteration (will call LLM again)
+          continue;
+        }
+
         output.appendLine("✅ Agent completed — no further actions.");
         vscode.window.showInformationMessage("Ollama Agent: Task complete!");
         return;
@@ -121,6 +175,11 @@ export class Agent {
 
       output.appendLine(`🔧 Executing ${parsed.actions.length} action(s)…`);
       const results = await executeActions(parsed.actions, undefined, this._mcpManager);
+
+      // Track whether the actions we just executed included a fetch_url so we can
+      // optionally prompt the model to extract the fetched content if it returns
+      // an empty actions array in the next turn.
+      lastActionsIncludedFetch = parsed.actions.some(a => a.tool === "fetch_url");
 
       for (const r of results) {
         const label = r.success ? "✅" : "❌";

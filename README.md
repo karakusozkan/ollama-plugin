@@ -16,6 +16,9 @@ An AI coding agent VS Code extension powered by Ollama running locally. This ext
 - 🔌 **MCP Server Support**: Extend capabilities with Model Context Protocol servers
 - 🔄 **Streaming Responses**: Real-time response streaming with stop capability
 - 📊 **Context Window Tracking**: Monitor token usage and remaining context
+- 🧭 **MCP Server Management & Debugging**: Add and manage MCP servers (including Playwright), attempt connections on add, and inspect MCP tools
+- 🛟 **Improved Logging & Debug Forwarding**: OutputChannel messages are forwarded to the Debug Console and configuration values are logged at startup for visibility
+- 🧰 **Enhanced Chat UX**: Resizable message area and last-prompt recall for faster iterative prompts
 
 ## Requirements
 
@@ -50,12 +53,51 @@ An AI coding agent VS Code extension powered by Ollama running locally. This ext
 
 Configure the extension through VS Code settings (`Ctrl+,` or `Cmd+,`):
 
-| Setting                   | Default                                      | Description                             |
-| ------------------------- | -------------------------------------------- | --------------------------------------- |
-| `ollamaAgent.endpoint`    | `http://localhost:11435/v1/chat/completions` | Ollama API endpoint (OpenAI-compatible) |
-| `ollamaAgent.model`       | `qwen2.5-coder:32b`                          | Model name to use for the agent         |
-| `ollamaAgent.temperature` | `0.2`                                        | Sampling temperature (0-2)              |
-| `ollamaAgent.mcpServers`  | `[]`                                         | MCP servers configuration               |
+| Setting                               | Default                           | Description                                                                  |
+| ------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------- |
+| `ollamaAgent.endpoint`                | `http://localhost:11434/api/chat` | Chat endpoint (native Ollama or OpenAI-compatible)                           |
+| `ollamaAgent.model`                   | `""`                              | Optional model override when discovery is unavailable                        |
+| `ollamaAgent.chatFormat`              | `"auto"`                          | Optional Ollama `/api/chat` format hint (`peg-native` for custom servers)    |
+| `ollamaAgent.temperature`             | `0.2`                             | Sampling temperature (0-2)                                                   |
+| `ollamaAgent.useStreaming`            | `true`                            | Use streaming chat responses when the server supports them                   |
+| `ollamaAgent.streamingStallTimeoutMs` | `60000`                           | Cancel stalled streaming requests after this many ms and retry non-streaming |
+| `ollamaAgent.mcpServers`              | `[]`                              | MCP servers configuration                                                    |
+
+The extension first tries Ollama-native model discovery via `/api/tags`, then falls back to OpenAI-compatible discovery via `/v1/models`. If your server only exposes chat completions, set `ollamaAgent.model` manually.
+
+If your server does not implement `/api/ps`, that is now treated as optional. The extension will use `/api/show` metadata to determine context size and continue normally.
+
+If your server accepts `/api/chat` but returns a normal `application/json` body even when `stream` is set to `true`, the extension now detects that and reads the response as a buffered reply automatically.
+
+If your server accepts `/api/chat` but does not finish streamed responses until the client disconnects, set `ollamaAgent.useStreaming` to `false`. The extension also retries non-streaming automatically when a stream produces no activity for `ollamaAgent.streamingStallTimeoutMs`.
+
+When the extension detects that a specific endpoint is not actually streaming, it now caches that result for the current VS Code session and stops sending `stream: true` to that endpoint on later requests.
+
+### Native Ollama-compatible server example
+
+For a server like yours that exposes `/api/tags`, `/api/show`, and `/api/chat` but not `/v1` routes, configure:
+
+```json
+{
+	"ollamaAgent.endpoint": "http://localhost:8080/api/chat",
+	"ollamaAgent.chatFormat": "peg-native"
+}
+```
+
+If your server uses a custom chat-format selector and logs `Chat format: peg-native`, set `ollamaAgent.chatFormat` to `peg-native` so the extension sends that format hint explicitly on `/api/chat` requests.
+
+### OpenAI-compatible local server example
+
+For a server like your `turbo-server` running on port `8080`, configure:
+
+```json
+{
+	"ollamaAgent.endpoint": "http://localhost:8080/v1/chat/completions",
+	"ollamaAgent.model": "Qwen3 Coder 30B A3B Instruct"
+}
+```
+
+If `/v1/models` returns a different model ID, use that exact ID instead of the display name above.
 
 ### Example MCP Server Configuration
 
@@ -72,6 +114,45 @@ Configure the extension through VS Code settings (`Ctrl+,` or `Cmd+,`):
 }
 ```
 
+### Playwright MCP server example
+
+You can run a Playwright-based MCP server to enable browser automation tools. Example configuration (uses the hypothetical `@modelcontextprotocol/server-playwright` package):
+
+```json
+{
+	"ollamaAgent.mcpServers": [
+		{
+			"name": "playwright",
+			"command": "npx",
+			"args": ["-y", "@modelcontextprotocol/server-playwright"],
+			"enabled": true,
+			"timeoutMs": 120000
+		}
+	]
+}
+```
+
+Notes:
+
+- `timeoutMs` increases the MCP request timeout for long-running browser actions.
+- The extension writes binary or file outputs from MCP tools to `.ollama-agent/mcp_outputs` in the workspace.
+
+## MCP Server Management & Debugging
+
+- Add MCP server: The extension includes a command to add a Playwright (or other) MCP server configuration and will attempt to connect after adding it. If the connection fails the extension surfaces diagnostic information in the Output and Debug Consoles.
+- Debug MCP tools: Use the `Ollama Agent: Debug MCP Tools` command to fetch registered tool details, endpoints, and capabilities from a connected MCP server.
+- UI improvements: The MCP server management view now uses collapsible sections with improved styling for easier navigation and state visibility.
+
+## Logging & Debug Forwarding
+
+- Debug Console forwarding: Messages written to the extension OutputChannel are forwarded to the Debug Console to make interactive debugging and breakpoints easier to correlate with agent output.
+- Startup configuration logging: Key configuration values (endpoint, enabled MCP servers, timeouts) are logged at startup to help with troubleshooting and reproducibility.
+
+## Chat Improvements
+
+- Resizable message area: The chat message input supports resizing so you can compose longer prompts comfortably.
+- Last-prompt recall: The chat will remember and offer the last prompt for quick re-use or iteration when composing follow-ups.
+
 ## Usage
 
 ### Opening the Chat
@@ -83,7 +164,7 @@ Configure the extension through VS Code settings (`Ctrl+,` or `Cmd+,`):
 ### Running a Task
 
 1. Open the chat panel
-2. Select your desired model from the dropdown
+2. Select a model discovered from Ollama in the dropdown
 3. Type your request (e.g., "Create a React component for a todo list")
 4. The agent will:
     - Analyze your request
@@ -183,10 +264,16 @@ The extension automatically adapts to your operating system:
 2. Verify the endpoint URL in settings
 3. Check that the model is downloaded: `ollama list`
 
+### OpenAI-Compatible Server Issues
+
+1. Verify the server responds on `/v1/chat/completions`
+2. If the model dropdown is empty, set `ollamaAgent.model` manually
+3. If available, check whether `/v1/models` returns the model ID the server expects
+
 ### Model Not Responding
 
 1. Check the Output panel (View → Output → Ollama Agent)
-2. Verify the model name is correct
+2. Verify the model appears in the Ollama model list
 3. Try a different model if the current one hangs
 
 ### MCP Server Errors

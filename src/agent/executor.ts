@@ -1,10 +1,12 @@
 import * as cp from "child_process";
 import * as path from "path";
+import { promises as fs } from "fs";
 import * as vscode from "vscode";
 import * as https from "https";
 import * as http from "http";
 import { ToolAction } from "./tools";
 import { McpManager } from "./mcp.js";
+import { listWorkspaceFiles } from "../utils/workspace.js";
 
 export interface ActionResult {
 	action: ToolAction;
@@ -78,6 +80,18 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpMana
 				return { action, success: true, output: content };
 			}
 
+			case "list_workspace_files": {
+				const listAction = action as { tool: "list_workspace_files"; limit?: number };
+				const requestedLimit = typeof listAction.limit === "number" ? Math.floor(listAction.limit) : 200;
+				const limit = Math.max(1, Math.min(1000, requestedLimit || 200));
+				const files = await listWorkspaceFiles(limit);
+				return {
+					action,
+					success: true,
+					output: JSON.stringify({ files, count: files.length, limit }, null, 2),
+				};
+			}
+
 			case "run_command": {
 				if (!("command" in action)) return { action, success: false, output: "run_command: missing command field." };
 				const command = (action as any).command as string;
@@ -113,6 +127,36 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpMana
 					return { action, success: false, output: `Failed to parse HTML: ${err instanceof Error ? err.message : String(err)}` };
 				}
 			}
+
+			case "list_mcp_servers": {
+				if (!mcpManager) {
+					return { action, success: true, output: "No MCP servers are configured." };
+				}
+
+				const servers = mcpManager.getServerSummaries();
+				if (servers.length === 0) {
+					return { action, success: true, output: "No MCP servers are configured." };
+				}
+
+				const output = JSON.stringify({ servers }, null, 2);
+				return { action, success: true, output };
+			}
+
+			case "list_mcp_tools": {
+				if (!mcpManager) {
+					return { action, success: true, output: "No MCP servers are configured." };
+				}
+
+				const listAction = action as { tool: "list_mcp_tools"; server?: string; includeDisabled?: boolean };
+				const tools = mcpManager.getToolSummaries(listAction.server, listAction.includeDisabled ?? false);
+				if (tools.length === 0) {
+					const scope = listAction.server ? ` for server \"${listAction.server}\"` : "";
+					return { action, success: true, output: `No MCP tools are currently available${scope}.` };
+				}
+
+				const output = JSON.stringify({ tools }, null, 2);
+				return { action, success: true, output };
+			}
 	
 			case "mcp_tool": {
 				if (!mcpManager) {
@@ -124,12 +168,62 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpMana
 				}
 				try {
 					const result = await mcpManager.callTool(mcpAction.server, mcpAction.name, mcpAction.arguments || {});
-					// Extract text content from the MCP result
-					const textParts = (result.content || [])
-						.filter(c => c.type === "text" && c.text)
-						.map(c => c.text!);
-					const output = textParts.join("\n") || "(no text content returned)";
-					return { action, success: !result.isError, output };
+					// Handle various content parts: text, data (base64), json
+					const contents = (result && (result as any).content) || [];
+					const textParts: string[] = [];
+					const savedFiles: string[] = [];
+					const outDir = workspaceRoot() ? path.join(workspaceRoot()!, ".ollama-agent", "mcp_outputs") : undefined;
+					if (outDir) await fs.mkdir(outDir, { recursive: true });
+					let idx = 0;
+					for (const c of contents) {
+						if (!c) continue;
+						const type = (c.type || "").toString();
+						if (type === "text" && c.text) {
+							textParts.push(c.text);
+							continue;
+						}
+						if (c.data) {
+							// Save base64-encoded data to workspace .ollama-agent/mcp_outputs
+							const mime = (c.mimeType || "").toString().toLowerCase();
+							const extMap: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "application/json": "json", "text/plain": "txt", "text/html": "html" };
+							let ext = "bin";
+							for (const k of Object.keys(extMap)) {
+								if (mime.startsWith(k)) {
+									ext = extMap[k];
+									break;
+								}
+							}
+							const fileName = `mcp_${mcpAction.server}_${mcpAction.name}_${idx}.${ext}`;
+							const filePath = outDir ? path.join(outDir, fileName) : fileName;
+							const buffer = Buffer.from(String(c.data), "base64");
+							if (outDir) await fs.writeFile(filePath, buffer);
+							savedFiles.push(filePath);
+							// If JSON mime, try to parse and include in textParts
+							if (mime === "application/json") {
+								try {
+									const parsed = JSON.parse(buffer.toString("utf8"));
+									textParts.push(JSON.stringify(parsed, null, 2));
+								} catch {
+									textParts.push(buffer.toString("utf8"));
+								}
+							}
+							idx++;
+							continue;
+						}
+						// Some servers may return JSON in a 'json' or 'data' field
+						if (type === "json" && c.data) {
+							try {
+								textParts.push(JSON.stringify(JSON.parse(String(c.data)), null, 2));
+							} catch {
+								textParts.push(String(c.data));
+							}
+						}
+					}
+					const outputParts: string[] = [];
+					if (textParts.length) outputParts.push(textParts.join("\n"));
+					if (savedFiles.length) outputParts.push(`Saved files:\n${savedFiles.join("\n")}`);
+					const output = outputParts.join("\n\n") || "(no text content returned)";
+					return { action, success: !(result as any).isError, output };
 				} catch (err) {
 					return { action, success: false, output: `MCP tool error: ${err instanceof Error ? err.message : String(err)}` };
 				}
