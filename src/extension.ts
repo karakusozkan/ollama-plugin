@@ -3,7 +3,7 @@ import { Agent } from "./agent/agent";
 import { OllamaProvider, estimateMessagesTokens, OllamaModel } from "./agent/llm";
 import { McpManager, McpServerConfig } from "./agent/mcp";
 import { executeActions } from "./agent/executor";
-import { buildSystemPrompt, ToolAction } from "./agent/tools";
+import { buildSystemPrompt, ToolAction, ExtendedToolAction } from "./agent/tools";
 
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -23,7 +23,7 @@ function prefixLogLines(message: string, timestamp = formatLogTimestamp()): stri
 
 interface SidebarAgentResponse {
   thought: string;
-  actions: ToolAction[];
+  actions: ExtendedToolAction[];
 }
 
 function parseSidebarAgentResponse(raw: string): SidebarAgentResponse {

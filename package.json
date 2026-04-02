@@ -45,6 +45,11 @@
 				"command": "ollamaAgent.addMcpServer",
 				"title": "Ollama Agent: Add MCP Server",
 				"icon": "$(add)"
+			},
+			{
+				"command": "ollamaAgent.addPlaywrightMcp",
+				"title": "Ollama Agent: Add Playwright MCP",
+				"icon": "$(globe)"
 			}
 		],
 		"viewsContainers": {

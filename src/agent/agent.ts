@@ -1,12 +1,12 @@
 import * as vscode from "vscode";
 import { LLMProvider, Message } from "./llm";
-import { buildSystemPrompt, ToolAction } from "./tools";
+import { buildSystemPrompt, ToolAction, ExtendedToolAction } from "./tools";
 import { executeActions, ActionResult } from "./executor";
 import { McpManager } from "./mcp.js";
 
 interface AgentResponse {
   thought: string;
-  actions: ToolAction[];
+  actions: ExtendedToolAction[];
 }
 
 /**

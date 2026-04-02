@@ -17,6 +17,17 @@ export type ToolAction =
   | { tool: "list_mcp_tools"; server?: string; includeDisabled?: boolean }
   | { tool: "mcp_tool"; server: string; name: string; arguments: Record<string, unknown> };
 
+/*
+ * High-level web search action. The executor will try to use a connected
+ * Playwright (or other browser-capable) MCP server if available. If no
+ * suitable MCP server or browser tools are found, the executor falls back
+ * to a direct 'fetch_url' request to perform the search.
+ */
+export type WebSearchAction = { tool: "web_search"; query: string; server?: string; engine?: "google" | "bing" | "duckduckgo" };
+
+// Append to ToolAction union
+export type ExtendedToolAction = ToolAction | WebSearchAction;
+
 /**
  * Detect the current operating system and return a descriptor string.
  */
@@ -131,6 +142,7 @@ and you can execute shell commands in the workspace root directory.
 10. The workspace file list and MCP tool inventory are NOT preloaded into this prompt.
   - If you need a workspace overview, call "list_workspace_files".
   - If you need to know which MCP servers or MCP tools are available, call "list_mcp_servers" and/or "list_mcp_tools" first.
+    - If "list_mcp_tools" returns no tools, the reason may be that: the named server is not configured, the server is configured but not connected, the server reported zero tools, or tools are present but disabled/filtered. In that case, check server connection with "list_mcp_servers", try "list_mcp_tools" with "includeDisabled": true, or run the Debug MCP Tools command to fetch raw tool definitions.
   - Before calling "mcp_tool", make sure you know the exact server name, tool name, and expected arguments.
 
 ## Available Tools
@@ -150,34 +162,23 @@ and you can execute shell commands in the workspace root directory.
 ${os.commandGuidance}
 
 ## Workflow for web content
-When the user asks about web content:
-1. Use fetch_url to get the page content — it returns clean readable text (NOT raw HTML).
-2. The tool result will contain the page text. Read it carefully.
-3. After receiving the text, provide your FULL answer in "thought" with empty "actions".
-4. Do NOT try to fetch individual article URLs from news sites — they are usually behind paywalls.
-  Instead, use the headlines and summaries already visible on the front page.
-5. NEVER fetch the same URL twice.
+When the user asks about web content (for example: "Search Google for X" or "Find MCP servers for Postgres"):
+1. Do NOT respond by saying you cannot browse. Instead, try to perform the requested web search.
+2. First call 'list_mcp_servers' and 'list_mcp_tools' as needed to discover available MCP servers and tools.
+  - If a browser-capable MCP server is available (e.g. Playwright, or any server exposing 'navigate', 'goto', 'page.*', 'browser_navigate', 'screenshot', or 'evaluate'-style tools), call those tools via the 'mcp_tool' action to navigate to the search engine and extract page text or screenshots.
+  - Prefer using the high-level 'web_search' action when available; set 'engine' to 'google' and supply the 'query' field. The executor will attempt a browser-based search first and fall back to 'fetch_url'.
+3. If no suitable MCP browser tools are available, fall back to 'fetch_url' on the search results page (e.g. 'https://www.google.com/search?q=...') and then parse the returned HTML to readable text.
+4. After obtaining the page text or extracted content, include the summarized search results in 'thought' and return an empty 'actions' array. Do not return a refusal or a statement that browsing is impossible.
+5. Do NOT fetch individual paywalled article URLs; instead use the search results snippets and the front page summary content.
+6. NEVER fetch the same exact URL twice in the same run.
 
 ## Response Schema
 {
   "thought": "<your reasoning, explanation, or answer to the user>",
-  "actions": [
-   { "tool": "read_file",   "path": "src/foo.ts" },
-   { "tool": "list_workspace_files", "limit": 100 },
-   { "tool": "edit_file",   "path": "src/foo.ts",  "content": "..." },
-   { "tool": "create_file", "path": "src/bar.ts",  "content": "..." },
-   { "tool": "delete_file", "path": "src/old.ts" },
-   { "tool": "run_command", "command": "npm test" },
-   { "tool": "fetch_url",   "url": "https://example.com" },
-   { "tool": "list_mcp_servers" },
-   { "tool": "list_mcp_tools", "server": "playwright" },
-   { "tool": "mcp_tool", "server": "playwright", "name": "browser_navigate", "arguments": { "url": "https://example.com" } }
-  ]
+  "actions": [ /* see available tools above for action shapes */ ]
 }
 
-"thought" is mandatory and is shown to the user. When actions is empty (task complete), "thought" should contain your FULL answer, summary, or explanation — not just a brief description of what you did.
-For example, if the user asked you to summarize a web page, put the full summary in "thought".
-If the task is not complete, you MUST include actions to continue working on it.
+Note: when the agent has finished the task it should return an empty "actions" array and place the final answer in the "thought" field.
 `;
 }
 

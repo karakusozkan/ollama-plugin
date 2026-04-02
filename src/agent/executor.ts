@@ -4,19 +4,19 @@ import { promises as fs } from "fs";
 import * as vscode from "vscode";
 import * as https from "https";
 import * as http from "http";
-import { ToolAction } from "./tools";
+import { ToolAction, ExtendedToolAction } from "./tools";
 import { McpManager } from "./mcp.js";
 import { listWorkspaceFiles } from "../utils/workspace.js";
 
 export interface ActionResult {
-	action: ToolAction;
+	action: ExtendedToolAction;
 	success: boolean;
-	output?: string; // non-empty for read_file or errors
+ 	output?: string; // non-empty for read_file or errors
 }
 
 //
 
-export async function executeActions(actions: ToolAction[], abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult[]> {
+export async function executeActions(actions: ExtendedToolAction[], abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult[]> {
 	const results: ActionResult[] = [];
 	for (const action of actions) {
 		if (abortSignal?.aborted) {
@@ -28,7 +28,7 @@ export async function executeActions(actions: ToolAction[], abortSignal?: AbortS
 	return results;
 }
 
-async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult> {
+async function executeOne(action: ExtendedToolAction, abortSignal?: AbortSignal, mcpManager?: McpManager): Promise<ActionResult> {
 	try {
 		switch (action.tool) {
 			case "create_file": {
@@ -150,8 +150,34 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpMana
 				const listAction = action as { tool: "list_mcp_tools"; server?: string; includeDisabled?: boolean };
 				const tools = mcpManager.getToolSummaries(listAction.server, listAction.includeDisabled ?? false);
 				if (tools.length === 0) {
-					const scope = listAction.server ? ` for server \"${listAction.server}\"` : "";
-					return { action, success: true, output: `No MCP tools are currently available${scope}.` };
+					// Provide more actionable diagnostics so the LLM or user understands why no tools were listed.
+					if (listAction.server) {
+						const serverSummary = mcpManager.getServerSummaries().find(s => s.name === listAction.server);
+						if (!serverSummary) {
+							return { action, success: true, output: `No MCP server named "${listAction.server}" is configured.` };
+						}
+						if (!serverSummary.connected) {
+							return {
+								action,
+								success: true,
+								output: `MCP server "${listAction.server}" is configured but not connected. It may have failed to start or be stopped. Check the 'Ollama Agent' output channel or run the Debug MCP Tools command for details.`,
+							};
+						}
+
+						// Server exists and is connected but returned no tools (or they are filtered out)
+						return {
+							action,
+							success: true,
+							output: `No MCP tools are currently available for server "${listAction.server}". This may mean the server reported zero tools, or tools are present but disabled/filtered. To include disabled tools, call list_mcp_tools with \"includeDisabled\": true, or run the Debug MCP Tools command to fetch raw tool definitions.`,
+						};
+					}
+
+					// No server was specified and there are no tools across connected servers.
+					return {
+						action,
+						success: true,
+						output: `No MCP tools are currently available. This may mean no connected servers exposed tools, or all tools are disabled. Run list_mcp_servers to inspect server connection status or call list_mcp_tools with \"includeDisabled\": true to see disabled tools.`,
+					};
 				}
 
 				const output = JSON.stringify({ tools }, null, 2);
@@ -226,6 +252,106 @@ async function executeOne(action: ToolAction, abortSignal?: AbortSignal, mcpMana
 					return { action, success: !(result as any).isError, output };
 				} catch (err) {
 					return { action, success: false, output: `MCP tool error: ${err instanceof Error ? err.message : String(err)}` };
+				}
+			}
+
+			case "web_search": {
+				const webAction = action as any as { tool: "web_search"; query: string; server?: string; engine?: string };
+				const query = webAction.query;
+				const engine = (webAction.engine as string) || "google";
+				const buildSearchUrl = (q: string) => {
+					if (engine === "bing") return `https://www.bing.com/search?q=${encodeURIComponent(q)}`;
+					if (engine === "duckduckgo") return `https://duckduckgo.com/html?q=${encodeURIComponent(q)}`;
+					// default: google
+					return `https://www.google.com/search?q=${encodeURIComponent(q)}&hl=en`;
+				};
+				const url = buildSearchUrl(query);
+				// Try to use a browser-capable MCP server if available
+				if (mcpManager) {
+					const allTools = mcpManager.getAllTools();
+					// Prefer a server that exposes navigation-like tools
+					const navCandidates = allTools.filter(t => /navigate|goto|open|page\.go|page\.goto|browser_navigate|browser.goto/i.test(t.tool.name));
+					const evalCandidates = allTools.filter(t => /evaluate|extract|query|screenshot|innerText|text|content|page_eval|page.evaluate/i.test(t.tool.name));
+					let usedServer: string | undefined;
+					let navToolName: string | undefined;
+					let evalToolName: string | undefined;
+					if (webAction.server) {
+						usedServer = webAction.server;
+						const serverTools = allTools.filter(t => t.serverName === usedServer).map(t => t.tool.name);
+						navToolName = serverTools.find(n => /navigate|goto|open|page\.go|page\.goto|browser_navigate|browser.goto/i.test(n));
+						evalToolName = serverTools.find(n => /evaluate|extract|query|screenshot|innerText|text|content|page_eval|page.evaluate/i.test(n));
+					} else if (navCandidates.length > 0) {
+						navToolName = navCandidates[0].tool.name;
+						usedServer = navCandidates[0].serverName;
+						// try to find an eval tool on the same server
+						evalToolName = evalCandidates.find(e => e.serverName === usedServer)?.tool.name;
+					} else if (allTools.length > 0) {
+						// Try any browser-like tool across servers
+						const anyBrowser = allTools.find(t => /browser|page|tab|playwright|chromium|firefox|webkit/i.test(t.tool.name));
+						if (anyBrowser) {
+							usedServer = anyBrowser.serverName;
+							navToolName = anyBrowser.tool.name;
+							evalToolName = evalCandidates.find(e => e.serverName === usedServer)?.tool.name;
+						}
+					}
+
+					if (usedServer && navToolName) {
+						try {
+							// Navigate to Google search URL
+							await mcpManager.callTool(usedServer, navToolName, { url });
+							// If we have an eval tool, try a few common argument shapes to extract text
+							let evalResult: any = null;
+							if (evalToolName) {
+								const trials = [
+									{ selector: "body" },
+									{ script: "return document.body.innerText" },
+									{},
+								];
+								for (const args of trials) {
+									try {
+										evalResult = await mcpManager.callTool(usedServer, evalToolName, args as Record<string, unknown>);
+										if (evalResult && Array.isArray((evalResult as any).content) && (evalResult as any).content.length > 0) break;
+									} catch {
+									// ignore trial failure and continue
+									continue;
+								}
+								}
+							}
+							// If we got evalResult, reuse mcp_tool processing to produce output
+							if (evalResult && (evalResult as any).content) {
+								const contents = (evalResult as any).content as any[];
+								const textParts: string[] = [];
+								for (const c of contents) {
+									if (!c) continue;
+									if ((c.type || "").toString() === "text" && c.text) {
+										textParts.push(c.text);
+										continue;
+									}
+									if (c.data) {
+										try {
+											const parsed = JSON.parse(String(c.data));
+											textParts.push(JSON.stringify(parsed, null, 2));
+										} catch {
+										textParts.push(String(c.data));
+									}
+									}
+								}
+								const output = textParts.join("\n\n") || "(no text content returned)";
+								return { action, success: true, output };
+							}
+							// If eval failed, fall back to direct fetch
+						} catch (err) {
+							// fall through to fallback
+						}
+					}
+				}
+				// Fallback: use fetchUrl to perform the search and parse text
+				try {
+					const html = await fetchUrl(url, 30000, abortSignal);
+					const text = parseHtmlToText(html);
+					return { action, success: true, output: text };
+				} catch (err) {
+					return { action, success: false, output: `Web search failed: ${err instanceof Error ? err.message : String(err)}` };
 				}
 			}
 		}
