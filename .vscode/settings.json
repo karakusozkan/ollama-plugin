@@ -2,12 +2,13 @@
 	"ollamaAgent.chatFormat": "peg-native",
 	"ollamaAgent.mcpServers": [
 		{
-			"name": "playwright",
-			"transport": "tcp",
-			"host": "127.0.0.1",
-			"port": 5000,
-			"enabled": true,
-			"timeoutMs": 120000
+			"name": "Playwright",
+			"command": "npx",
+			"args": [
+				"-y",
+				"@playwright/mcp@latest"
+			],
+			"enabled": true
 		}
 	]
 }

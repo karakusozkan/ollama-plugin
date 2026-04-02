@@ -86,7 +86,6 @@ function buildFeedbackMessage(results: ActionResult[]): string {
  * an empty actions array (or we hit the iteration cap).
  */
 export class Agent {
-  private readonly maxIterations = 8;
   private _mcpManager?: McpManager;
 
   constructor(private readonly llm: LLMProvider) {}
@@ -96,6 +95,7 @@ export class Agent {
   }
 
   async run(goal: string, output: vscode.OutputChannel, abortSignal?: AbortSignal): Promise<void> {
+    const maxIterations = vscode.workspace.getConfiguration("ollamaAgent").get<number>("maxIterations", 8);
     const messages: Message[] = [
       { role: "system", content: buildSystemPrompt(this._mcpManager) },
       { role: "user", content: goal },
@@ -104,7 +104,7 @@ export class Agent {
     let lastActionsIncludedFetch = false;
     let fetchExtractionRetryUsed = false;
 
-    for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
+    for (let iteration = 1; iteration <= maxIterations; iteration++) {
       output.appendLine(`\n── Iteration ${iteration} ──────────────────────`);
       output.appendLine("⏳ Waiting for LLM…");
 

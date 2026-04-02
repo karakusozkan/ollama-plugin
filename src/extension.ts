@@ -1214,7 +1214,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
       try {
         const agentConfig = vscode.workspace.getConfiguration("ollamaAgent");
         const useStreaming = agentConfig.get<boolean>("useStreaming", true);
-        const maxIterations = 8;
+        const maxIterations = agentConfig.get<number>("maxIterations", 8);
 
         if (!this._initialized) {
           await this._syncChatSystemPrompt();

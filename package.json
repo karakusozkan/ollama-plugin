@@ -123,6 +123,12 @@
 					"minimum": 0,
 					"description": "How long to wait for a chat request to finish before aborting it. Applies to the initial request setup and to non-streaming responses. Set to 0 to disable the timeout."
 				},
+				"ollamaAgent.maxIterations": {
+					"type": "number",
+					"default": 8,
+					"minimum": 1,
+					"description": "Maximum number of think-act iterations the agent can perform before stopping. Applies to both one-off runs and the chat sidebar."
+				},
 				"ollamaAgent.mcpServers": {
 					"type": "array",
 					"default": [],

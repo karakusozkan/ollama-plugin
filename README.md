@@ -75,6 +75,7 @@ Configure the extension through VS Code settings (`Ctrl+,` or `Cmd+,`):
 | `ollamaAgent.temperature`             | `0.2`                             | Sampling temperature (0-2)                                                   |
 | `ollamaAgent.useStreaming`            | `true`                            | Use streaming chat responses when the server supports them                   |
 | `ollamaAgent.streamingStallTimeoutMs` | `60000`                           | Cancel stalled streaming requests after this many ms and retry non-streaming |
+| `ollamaAgent.maxIterations`           | `8`                               | Maximum number of think-act iterations the agent can perform per request     |
 | `ollamaAgent.mcpServers`              | `[]`                              | MCP servers configuration                                                    |
 
 The extension first tries Ollama-native model discovery via `/api/tags`, then falls back to OpenAI-compatible discovery via `/v1/models`. If your server only exposes chat completions, set `ollamaAgent.model` manually.
