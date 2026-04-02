@@ -1,7 +1,9 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import { Agent } from "./agent/agent";
 import { OllamaProvider, estimateMessagesTokens, OllamaModel } from "./agent/llm";
 import { McpManager, McpServerConfig } from "./agent/mcp";
+import { installScaffoldDependencies, McpScaffoldTemplate, scaffoldMcpServerFiles } from "./agent/mcpScaffold";
 import { executeActions } from "./agent/executor";
 import { buildSystemPrompt, ExtendedToolAction, normalizeToolActions } from "./agent/tools";
 
@@ -321,6 +323,15 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(addPlaywrightMcpCommand);
 
+  // ── ollamaAgent.scaffoldMcpServer ────────────────────────────────────────
+  const scaffoldMcpServerCommand = vscode.commands.registerCommand(
+    "ollamaAgent.scaffoldMcpServer",
+    async () => {
+      await promptAndScaffoldMcpServer(mcpManager, outputChannel);
+    }
+  );
+  context.subscriptions.push(scaffoldMcpServerCommand);
+
   // ── ollamaAgent.debugMcpTools ─────────────────────────────────────────────
   const debugMcpToolsCommand = vscode.commands.registerCommand(
     "ollamaAgent.debugMcpTools",
@@ -382,7 +393,8 @@ async function addMcpServer(mcpManager: McpManager, outputChannel: vscode.Output
   
   // Build list items: existing servers + "Add new server" option
   const items: vscode.QuickPickItem[] = [
-    { label: "$(add) Add new MCP server", description: "Create a new MCP server configuration" }
+    { label: "$(add) Add new MCP server", description: "Create a new MCP server configuration" },
+    { label: "$(tools) Scaffold local MCP server", description: "Generate a starter MCP server in this workspace and optionally connect it" }
   ];
   
   for (const server of existingServers) {
@@ -408,6 +420,11 @@ async function addMcpServer(mcpManager: McpManager, outputChannel: vscode.Output
   // Check if user selected "Add new server"
   if (selected.label.includes("Add new MCP server")) {
     await promptAndAddServer(mcpManager, outputChannel, existingServers);
+    return;
+  }
+
+  if (selected.label.includes("Scaffold local MCP server")) {
+    await promptAndScaffoldMcpServer(mcpManager, outputChannel);
     return;
   }
   
@@ -597,6 +614,111 @@ async function saveAndReload(
   } catch (err) {
     const errMessage = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`Failed to update MCP server: ${errMessage}`);
+  }
+}
+
+async function promptAndScaffoldMcpServer(
+  mcpManager: McpManager,
+  outputChannel: vscode.OutputChannel
+): Promise<void> {
+  const name = await vscode.window.showInputBox({
+    prompt: "MCP server name",
+    placeHolder: "e.g., local-tools or web-helper",
+    validateInput: (value) => value.trim().length > 0 ? null : "Server name is required",
+  });
+
+  if (!name) {
+    return;
+  }
+
+  const templatePick = await vscode.window.showQuickPick([
+    { label: "Basic starter", description: "Creates echo and time tools", detail: "Template: basic", picked: true },
+    { label: "Web helper", description: "Creates fetch_url and search_web tools", detail: "Template: web" },
+  ], {
+    placeHolder: "Choose the MCP server template",
+  });
+
+  if (!templatePick) {
+    return;
+  }
+
+  const template: McpScaffoldTemplate = templatePick.detail?.includes("web") ? "web" : "basic";
+  const defaultDirectory = `mcp-servers/${name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "mcp-server"}`;
+  const directory = await vscode.window.showInputBox({
+    prompt: "Target directory inside the workspace",
+    value: defaultDirectory,
+    validateInput: (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return "Directory is required";
+      }
+      if (trimmed.includes("..")) {
+        return "Directory must stay inside the workspace";
+      }
+      return null;
+    },
+  });
+
+  if (!directory) {
+    return;
+  }
+
+  const installPick = await vscode.window.showQuickPick([
+    { label: "Install dependencies and connect", description: "Runs npm install, registers the server, and attempts to connect", picked: true },
+    { label: "Scaffold and register only", description: "Writes files and saves MCP config without installing yet" },
+    { label: "Scaffold files only", description: "Writes files without changing MCP settings" },
+  ], {
+    placeHolder: "Choose how far the scaffold workflow should go",
+  });
+
+  if (!installPick) {
+    return;
+  }
+
+  const shouldInstall = installPick.label.includes("Install dependencies and connect");
+  const shouldRegister = !installPick.label.includes("Scaffold files only");
+
+  outputChannel.show(true);
+  outputChannel.appendLine(`[MCP] Scaffolding local MCP server "${name}" using template "${template}"...`);
+
+  try {
+    const scaffoldResult = await scaffoldMcpServerFiles({ name, template, directory });
+    let installResult: Awaited<ReturnType<typeof installScaffoldDependencies>> | undefined;
+    let registrationResult: Awaited<ReturnType<McpManager["upsertServerConfig"]>> | undefined;
+
+    if (shouldInstall) {
+      outputChannel.appendLine(`[MCP] Installing dependencies in ${scaffoldResult.relativeDirectory}...`);
+      installResult = await installScaffoldDependencies(scaffoldResult.absoluteDirectory);
+      outputChannel.appendLine(`[MCP] npm install exit code: ${installResult.exitCode}`);
+      if (installResult.stdout.trim()) {
+        outputChannel.appendLine(installResult.stdout.trim());
+      }
+      if (installResult.stderr.trim()) {
+        outputChannel.appendLine(installResult.stderr.trim());
+      }
+      if (!installResult.success) {
+        vscode.window.showWarningMessage(`Scaffolded ${scaffoldResult.relativeDirectory}, but npm install failed. See the Ollama Agent output for details.`);
+      }
+    }
+
+    if (shouldRegister) {
+      registrationResult = await mcpManager.upsertServerConfig(scaffoldResult.serverConfig, shouldInstall && (installResult?.success ?? true));
+    }
+
+    const serverUri = vscode.Uri.file(path.join(scaffoldResult.absoluteDirectory, "server.js"));
+    const document = await vscode.workspace.openTextDocument(serverUri);
+    await vscode.window.showTextDocument(document, { preview: false });
+
+    const summary = [
+      `Scaffolded ${scaffoldResult.relativeDirectory}.`,
+      shouldInstall ? (installResult?.success ? "Dependencies installed." : "Dependencies failed to install.") : "Dependencies not installed.",
+      shouldRegister ? (registrationResult?.connected ? `Registered and connected as ${registrationResult.name}.` : `Registered as ${registrationResult?.name || scaffoldResult.serverConfig.name}.`) : "MCP config not changed.",
+    ].join(" ");
+
+    vscode.window.showInformationMessage(summary);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Failed to scaffold MCP server: ${message}`);
   }
 }
 

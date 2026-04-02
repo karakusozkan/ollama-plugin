@@ -6,6 +6,7 @@ import * as https from "https";
 import * as http from "http";
 import { ToolAction, ExtendedToolAction } from "./tools";
 import { McpManager } from "./mcp.js";
+import { installScaffoldDependencies, scaffoldMcpServerFiles } from "./mcpScaffold.js";
 import { listWorkspaceFiles } from "../utils/workspace.js";
 
 export interface ActionResult {
@@ -182,6 +183,146 @@ async function executeOne(action: ExtendedToolAction, abortSignal?: AbortSignal,
 
 				const output = JSON.stringify({ tools }, null, 2);
 				return { action, success: true, output };
+			}
+
+			case "scaffold_mcp_server": {
+				const scaffoldAction = action as {
+					tool: "scaffold_mcp_server";
+					name?: string;
+					template?: "basic" | "web";
+					directory?: string;
+					install?: boolean;
+					register?: boolean;
+					connect?: boolean;
+					overwrite?: boolean;
+				};
+
+				if (!scaffoldAction.name) {
+					return { action, success: false, output: "scaffold_mcp_server: missing name field." };
+				}
+
+				try {
+					const scaffoldResult = await scaffoldMcpServerFiles({
+						name: scaffoldAction.name,
+						template: scaffoldAction.template,
+						directory: scaffoldAction.directory,
+						overwrite: scaffoldAction.overwrite,
+					});
+
+					const shouldInstall = scaffoldAction.install ?? true;
+					const shouldRegister = scaffoldAction.register ?? true;
+					const shouldConnect = scaffoldAction.connect ?? shouldRegister;
+
+					let installResult: Awaited<ReturnType<typeof installScaffoldDependencies>> | undefined;
+					if (shouldInstall) {
+						installResult = await installScaffoldDependencies(scaffoldResult.absoluteDirectory);
+						if (!installResult.success) {
+							return {
+								action,
+								success: false,
+								output: JSON.stringify({ scaffoldResult, installResult }, null, 2),
+							};
+						}
+					}
+
+					let registrationResult: unknown;
+					if (shouldRegister) {
+						if (!mcpManager) {
+							return {
+								action,
+								success: false,
+								output: JSON.stringify({
+									scaffoldResult,
+									installResult,
+									error: "MCP manager is not available for registration.",
+								}, null, 2),
+							};
+						}
+
+						registrationResult = await mcpManager.upsertServerConfig(
+							scaffoldResult.serverConfig,
+							shouldConnect && (installResult?.success ?? true)
+						);
+					}
+
+					return {
+						action,
+						success: true,
+						output: JSON.stringify({ scaffoldResult, installResult, registrationResult }, null, 2),
+					};
+				} catch (err) {
+					return { action, success: false, output: `Failed to scaffold MCP server: ${err instanceof Error ? err.message : String(err)}` };
+				}
+			}
+
+			case "upsert_mcp_server": {
+				if (!mcpManager) {
+					return { action, success: false, output: "MCP manager is not available." };
+				}
+
+				const configAction = action as {
+					tool: "upsert_mcp_server";
+					config?: {
+						name?: string;
+						command?: string;
+						args?: string[];
+						env?: Record<string, string>;
+						cwd?: string;
+						enabled?: boolean;
+						transport?: "stdio" | "tcp";
+						host?: string;
+						port?: number;
+						timeoutMs?: number;
+						connectTimeoutMs?: number;
+					};
+					connect?: boolean;
+				};
+
+				if (!configAction.config?.name || !configAction.config?.command) {
+					return { action, success: false, output: 'upsert_mcp_server: missing config.name or config.command.' };
+				}
+
+				try {
+					const result = await mcpManager.upsertServerConfig({
+						...configAction.config,
+						name: configAction.config.name,
+						command: configAction.config.command,
+					}, configAction.connect !== false);
+					return { action, success: result.connected || !result.reloaded, output: JSON.stringify(result, null, 2) };
+				} catch (err) {
+					return { action, success: false, output: `Failed to save MCP server: ${err instanceof Error ? err.message : String(err)}` };
+				}
+			}
+
+			case "remove_mcp_server": {
+				if (!mcpManager) {
+					return { action, success: false, output: "MCP manager is not available." };
+				}
+
+				const removeAction = action as { tool: "remove_mcp_server"; name?: string };
+				if (!removeAction.name) {
+					return { action, success: false, output: "remove_mcp_server: missing name field." };
+				}
+
+				try {
+					const result = await mcpManager.removeServerConfig(removeAction.name, true);
+					return { action, success: result.removed ?? false, output: JSON.stringify(result, null, 2) };
+				} catch (err) {
+					return { action, success: false, output: `Failed to remove MCP server: ${err instanceof Error ? err.message : String(err)}` };
+				}
+			}
+
+			case "reload_mcp_servers": {
+				if (!mcpManager) {
+					return { action, success: false, output: "MCP manager is not available." };
+				}
+
+				try {
+					const result = await mcpManager.reloadServers();
+					return { action, success: true, output: JSON.stringify(result, null, 2) };
+				} catch (err) {
+					return { action, success: false, output: `Failed to reload MCP servers: ${err instanceof Error ? err.message : String(err)}` };
+				}
 			}
 	
 			case "mcp_tool": {

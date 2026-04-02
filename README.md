@@ -10,6 +10,8 @@ An AI coding plugin for VS Code powered by Ollama running locally. This project 
 
 - Improved streaming detection and automatic fallback to buffered responses when servers do not stream as expected.
 - MCP server tooling enhancements: optional `/api/ps` handling, Playwright MCP example, and better error diagnostics.
+- The agent now receives live MCP server/tool inventory in its system prompt and can add, update, remove, and reload MCP servers during a session.
+- Built-in MCP scaffolding workflow: generate a local MCP server starter, optionally install dependencies, register it, and connect it from the extension.
 - Debugging and logging improvements: output forwarded to Debug Console and key settings logged at startup.
 
 ## Compatibility
@@ -31,6 +33,8 @@ An AI coding plugin for VS Code powered by Ollama running locally. This project 
 - 🔄 **Streaming Responses**: Real-time response streaming with stop capability
 - 📊 **Context Window Tracking**: Monitor token usage and remaining context
 - 🧭 **MCP Server Management & Debugging**: Add and manage MCP servers (including Playwright), attempt connections on add, and inspect MCP tools
+- 🧠 **MCP-Aware Agent Planning**: The LLM is told which MCP servers and tools are currently available so it can use them for browsing, automation, and external integrations
+- 🏗️ **Local MCP Server Scaffolding**: Create a ready-to-edit Node-based MCP server starter directly in your workspace
 - 🛟 **Improved Logging & Debug Forwarding**: OutputChannel messages are forwarded to the Debug Console and configuration values are logged at startup for visibility
 - 🧰 **Enhanced Chat UX**: Resizable message area and last-prompt recall for faster iterative prompts
 
@@ -190,24 +194,48 @@ Notes:
 
 ### Available Commands
 
-| Command              | Description                          |
-| -------------------- | ------------------------------------ |
-| `Ollama Agent: Run`  | Execute a one-off task via input box |
-| `Ollama Agent: Chat` | Open the sidebar chat panel          |
+| Command                             | Description                                                   |
+| ----------------------------------- | ------------------------------------------------------------- |
+| `Ollama Agent: Run`                 | Execute a one-off task via input box                          |
+| `Ollama Agent: Chat`                | Open the sidebar chat panel                                   |
+| `Ollama Agent: Scaffold MCP Server` | Generate a local MCP server starter and optionally connect it |
 
 ## Agent Capabilities
 
 The agent can perform the following actions:
 
-| Action        | Description                              |
-| ------------- | ---------------------------------------- |
-| `read_file`   | Read any file in the workspace           |
-| `create_file` | Create new files                         |
-| `edit_file`   | Modify existing files (full overwrite)   |
-| `delete_file` | Delete files (moves to trash)            |
-| `run_command` | Execute shell commands in workspace root |
-| `fetch_url`   | Fetch web content as readable text       |
-| `mcp_tool`    | Invoke tools from connected MCP servers  |
+| Action                | Description                                                                  |
+| --------------------- | ---------------------------------------------------------------------------- |
+| `read_file`           | Read any file in the workspace                                               |
+| `create_file`         | Create new files                                                             |
+| `edit_file`           | Modify existing files (full overwrite)                                       |
+| `delete_file`         | Delete files (moves to trash)                                                |
+| `run_command`         | Execute shell commands in workspace root                                     |
+| `fetch_url`           | Fetch web content as readable text                                           |
+| `list_mcp_servers`    | Inspect configured MCP servers and connection state                          |
+| `list_mcp_tools`      | Inspect available MCP tools and argument schemas                             |
+| `scaffold_mcp_server` | Create a local MCP server starter and optionally install/register/connect it |
+| `upsert_mcp_server`   | Add or update an MCP server configuration and reconnect                      |
+| `remove_mcp_server`   | Remove an MCP server configuration                                           |
+| `reload_mcp_servers`  | Reload MCP settings and reconnect configured servers                         |
+| `mcp_tool`            | Invoke tools from connected MCP servers                                      |
+
+This lets the agent do two MCP-specific workflows that were previously unreliable:
+
+- Use connected browser-capable MCP servers for navigation and online tasks instead of assuming browsing is unavailable.
+- Create a new MCP server in the workspace, install/build it, register it in settings, and connect it without leaving the chat.
+
+## Scaffold A Local MCP Server
+
+Use the command `Ollama Agent: Scaffold MCP Server` to generate a local MCP server starter under `mcp-servers/<name>`.
+
+The workflow can:
+
+- scaffold a `basic` template with `echo` and `get_time` tools,
+- scaffold a `web` template with `fetch_url` and `search_web` tools,
+- run `npm install` in the generated folder,
+- add the generated server to `ollamaAgent.mcpServers`, and
+- attempt to connect it immediately.
 
 ## Supported Models
 

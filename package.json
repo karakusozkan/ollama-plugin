@@ -2,7 +2,7 @@
 	"name": "ollama-agentz",
 	"displayName": "Ollama agentz",
 	"description": "An AI coding agent powered by Ollama running locally",
-	"version": "0.0.5",
+	"version": "0.0.6",
 	"publisher": "ollama-agentz",
 	"repository": {
 		"type": "git",
@@ -50,6 +50,11 @@
 				"command": "ollamaAgent.addPlaywrightMcp",
 				"title": "Ollama Agent: Add Playwright MCP",
 				"icon": "$(globe)"
+			},
+			{
+				"command": "ollamaAgent.scaffoldMcpServer",
+				"title": "Ollama Agent: Scaffold MCP Server",
+				"icon": "$(tools)"
 			}
 		],
 		"viewsContainers": {

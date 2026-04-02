@@ -58,6 +58,19 @@ export interface McpServerSummary {
   toolCount: number;
 }
 
+export interface McpServerConfigUpdateResult {
+  action: "upsert" | "remove" | "reload";
+  name?: string;
+  existed?: boolean;
+  removed?: boolean;
+  reloaded: boolean;
+  connected?: boolean;
+  connectedCount: number;
+  toolCount: number;
+  server?: McpServerSummary;
+  servers?: McpServerSummary[];
+}
+
 export interface McpToolSummary {
   serverName: string;
   name: string;
@@ -852,6 +865,84 @@ export class McpManager {
       });
   }
 
+  async upsertServerConfig(serverConfig: McpServerConfig, connect = true): Promise<McpServerConfigUpdateResult> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const servers = config.get<McpServerConfig[]>("mcpServers", []);
+    const nextConfig: McpServerConfig = {
+      ...serverConfig,
+      name: serverConfig.name.trim(),
+      command: serverConfig.command.trim(),
+      args: serverConfig.args?.filter((value) => value.trim().length > 0),
+      cwd: serverConfig.cwd?.trim() || undefined,
+      enabled: serverConfig.enabled !== false,
+    };
+
+    const existingIndex = servers.findIndex((server) => server.name === nextConfig.name);
+    const existed = existingIndex >= 0;
+    if (existed) {
+      servers[existingIndex] = nextConfig;
+    } else {
+      servers.push(nextConfig);
+    }
+
+    await config.update("mcpServers", servers, vscode.ConfigurationTarget.Workspace);
+
+    if (connect) {
+      await this.loadFromSettings();
+    }
+
+    const summaries = this.getServerSummaries();
+    const summary = summaries.find((server) => server.name === nextConfig.name);
+
+    return {
+      action: "upsert",
+      name: nextConfig.name,
+      existed,
+      reloaded: connect,
+      connected: summary?.connected,
+      connectedCount: this.connectedCount,
+      toolCount: this.getAllTools().length,
+      server: summary,
+      servers: summaries,
+    };
+  }
+
+  async removeServerConfig(serverName: string, reload = true): Promise<McpServerConfigUpdateResult> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const servers = config.get<McpServerConfig[]>("mcpServers", []);
+    const nextServers = servers.filter((server) => server.name !== serverName);
+    const removed = nextServers.length !== servers.length;
+
+    if (removed) {
+      await config.update("mcpServers", nextServers, vscode.ConfigurationTarget.Workspace);
+    }
+
+    if (reload) {
+      await this.loadFromSettings();
+    }
+
+    return {
+      action: "remove",
+      name: serverName,
+      removed,
+      reloaded: reload,
+      connectedCount: this.connectedCount,
+      toolCount: this.getAllTools().length,
+      servers: this.getServerSummaries(),
+    };
+  }
+
+  async reloadServers(): Promise<McpServerConfigUpdateResult> {
+    await this.loadFromSettings();
+    return {
+      action: "reload",
+      reloaded: true,
+      connectedCount: this.connectedCount,
+      toolCount: this.getAllTools().length,
+      servers: this.getServerSummaries(),
+    };
+  }
+
   /**
    * Call a tool on a specific MCP server.
    */
@@ -972,6 +1063,36 @@ export class McpManager {
         }
       }
       lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  buildAgentContextDescription(): string {
+    const summaries = this.getServerSummaries();
+    const lines: string[] = ["", "## MCP Availability"];
+
+    if (summaries.length === 0) {
+      lines.push("No MCP servers are configured right now.");
+      lines.push('You may add one with the "upsert_mcp_server" action and connect it with "reload_mcp_servers" after creating any needed files.');
+      return lines.join("\n");
+    }
+
+    lines.push("Configured MCP servers:");
+    for (const server of summaries) {
+      const transport = server.transport === "tcp"
+        ? `tcp ${server.host || "127.0.0.1"}:${server.port ?? "?"}`
+        : `${server.command || "?"}${server.args?.length ? ` ${server.args.join(" ")}` : ""}`;
+      lines.push(`- ${server.name}: ${server.connected ? "connected" : "not connected"}; enabled=${server.enabled}; tools=${server.toolCount}; transport=${transport}`);
+    }
+
+    const toolsDescription = this.buildToolsDescription();
+    if (toolsDescription) {
+      lines.push(toolsDescription);
+    } else {
+      lines.push("");
+      lines.push("No enabled MCP tools are currently available from connected servers.");
+      lines.push('If a server should expose tools, inspect it with "list_mcp_tools" or reconnect with "reload_mcp_servers".');
     }
 
     return lines.join("\n");

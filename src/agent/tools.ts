@@ -15,6 +15,35 @@ export type ToolAction =
   | { tool: "parse_content"; html: string }
   | { tool: "list_mcp_servers" }
   | { tool: "list_mcp_tools"; server?: string; includeDisabled?: boolean }
+  | {
+      tool: "scaffold_mcp_server";
+      name: string;
+      template?: "basic" | "web";
+      directory?: string;
+      install?: boolean;
+      register?: boolean;
+      connect?: boolean;
+      overwrite?: boolean;
+    }
+  | {
+      tool: "upsert_mcp_server";
+      config: {
+        name: string;
+        command: string;
+        args?: string[];
+        env?: Record<string, string>;
+        cwd?: string;
+        enabled?: boolean;
+        transport?: "stdio" | "tcp";
+        host?: string;
+        port?: number;
+        timeoutMs?: number;
+        connectTimeoutMs?: number;
+      };
+      connect?: boolean;
+    }
+  | { tool: "remove_mcp_server"; name: string }
+  | { tool: "reload_mcp_servers" }
   | { tool: "mcp_tool"; server: string; name: string; arguments: Record<string, unknown> };
 
 /*
@@ -136,6 +165,17 @@ Additional notes:
  */
 export function buildSystemPrompt(mcpManager?: McpManager): string {
   const os = getOSDescriptor();
+  const mcpContext = mcpManager?.buildAgentContextDescription() || `
+## MCP Availability
+No MCP servers are currently configured.
+
+You can still create and use one in this session:
+- Scaffold a starter with scaffold_mcp_server.
+- Or create the server files manually with create_file/edit_file.
+- Install any dependencies with run_command.
+- Register it with upsert_mcp_server.
+- Start or reconnect it with reload_mcp_servers.
+`;
   return `\
 You are an expert coding agent embedded inside VS Code.
 You have FULL READ AND WRITE ACCESS to every file in the user's open workspace,
@@ -165,9 +205,23 @@ and you can execute shell commands in the workspace root directory.
   doesn't require file operations or commands, respond with an empty "actions" array
   and put your conversational response in "thought". Do NOT read files or run commands
   unless the user explicitly asks you to do something with their code or project.
-10. The workspace file list and MCP tool inventory are NOT preloaded into this prompt.
+10. Tools are a first-class capability in this environment. You have both built-in tools and MCP tools.
+  - Do NOT act like you are limited to plain text replies when the task clearly requires inspecting files, editing code, running commands, fetching a page, or using an MCP integration.
+  - Choose the simplest tool that directly solves the task. Prefer built-in tools for normal workspace operations. Prefer MCP only when it adds a capability the built-in tools do not provide.
+11. Built-in tools are available right now and should be your default choice for common tasks.
+  - Use "list_workspace_files" to inspect the repo structure.
+  - Use "read_file", "create_file", "edit_file", and "delete_file" for file work.
+  - Use "run_command" to install dependencies, build, test, lint, inspect the environment, or run project scripts.
+  - Use "fetch_url" for direct HTTP page retrieval when browser automation is not required.
+  - Use "web_search" for high-level search when that is the quickest route.
+  - If the user asks you to change code, debug something, inspect the repo, run tests, or check a webpage, you should normally use one or more of these built-in tools instead of only answering in prose.
+12. MCP servers are also a first-class capability in this environment.
+  - For browser automation, navigation, web interaction, online workflows, APIs, or external systems, prefer MCP tools whenever they fit the task.
+  - If the current MCP inventory is insufficient, you may scaffold a new MCP server with "scaffold_mcp_server" or create one manually in the workspace, then register it with "upsert_mcp_server" and connect it with "reload_mcp_servers".
+  - Do NOT claim you cannot browse or access online systems until you have checked the available MCP servers/tools or attempted a suitable fallback.
+13. The workspace file list is NOT preloaded into this prompt, and MCP inventory may change during the session.
   - If you need a workspace overview, call "list_workspace_files".
-  - If you need to know which MCP servers or MCP tools are available, call "list_mcp_servers" and/or "list_mcp_tools" first.
+  - The current MCP inventory is summarized below, but you may still call "list_mcp_servers" and/or "list_mcp_tools" to refresh it before acting.
     - If "list_mcp_tools" returns no tools, the reason may be that: the named server is not configured, the server is configured but not connected, the server reported zero tools, or tools are present but disabled/filtered. In that case, check server connection with "list_mcp_servers", try "list_mcp_tools" with "includeDisabled": true, or run the Debug MCP Tools command to fetch raw tool definitions.
   - Before calling "mcp_tool", make sure you know the exact server name, tool name, and expected arguments.
 
@@ -183,20 +237,35 @@ and you can execute shell commands in the workspace root directory.
 | fetch_url     | url               | Fetch a URL and return its content as clean readable text (large pages are automatically truncated) |
 | list_mcp_servers | none           | List configured MCP servers and their current connection status    |
 | list_mcp_tools | server, includeDisabled | List MCP tools on demand instead of assuming a tool inventory |
+| scaffold_mcp_server | name, template, directory, install, register, connect | Scaffold a local Node-based MCP server starter in the workspace |
+| upsert_mcp_server | config, connect | Add or update an MCP server configuration and optionally reconnect all servers |
+| remove_mcp_server | name          | Remove an MCP server configuration from settings                  |
+| reload_mcp_servers | none         | Reload MCP server settings and reconnect configured servers       |
 | mcp_tool      | server, name, arguments | Call a specific MCP tool once you know its exact schema     |
 
 ${os.commandGuidance}
 
+## Tool Selection Guide
+- For repo exploration or code understanding: use list_workspace_files and read_file.
+- For code changes: read_file first, then edit_file or create_file, then run_command to validate when appropriate.
+- For installs, builds, tests, linting, and environment inspection: use run_command.
+- For direct webpage retrieval or quick HTTP content access: use fetch_url.
+- For browsing, multi-step web interaction, external systems, or specialized integrations: use MCP tools.
+- Do not overuse MCP when a built-in tool already solves the task directly.
+
+${mcpContext}
+
 ## Workflow for web content
 When the user asks about web content (for example: "Search Google for X" or "Find MCP servers for Postgres"):
 1. Do NOT respond by saying you cannot browse. Instead, try to perform the requested web search.
-2. First call 'list_mcp_servers' and 'list_mcp_tools' as needed to discover available MCP servers and tools.
+2. First inspect the current MCP inventory below and call 'list_mcp_servers' and 'list_mcp_tools' as needed to refresh it.
   - If a browser-capable MCP server is available (e.g. Playwright, or any server exposing 'navigate', 'goto', 'page.*', 'browser_navigate', 'screenshot', or 'evaluate'-style tools), call those tools via the 'mcp_tool' action to navigate to the search engine and extract page text or screenshots.
   - Prefer using the high-level 'web_search' action when available; set 'engine' to 'google' and supply the 'query' field. The executor will attempt a browser-based search first and fall back to 'fetch_url'.
-3. If no suitable MCP browser tools are available, fall back to 'fetch_url' on the search results page (e.g. 'https://www.google.com/search?q=...') and then parse the returned HTML to readable text.
-4. After obtaining the page text or extracted content, include the summarized search results in 'thought' and return an empty 'actions' array. Do not return a refusal or a statement that browsing is impossible.
-5. Do NOT fetch individual paywalled article URLs; instead use the search results snippets and the front page summary content.
-6. NEVER fetch the same exact URL twice in the same run.
+3. If no suitable MCP browser tools are available but browsing is needed, you may scaffold and register a new local MCP server when that is practical for the user's request.
+4. If no suitable MCP browser tools are available or creating one is not practical, fall back to 'fetch_url' on the search results page (e.g. 'https://www.google.com/search?q=...') and then parse the returned HTML to readable text.
+5. After obtaining the page text or extracted content, include the summarized search results in 'thought' and return an empty 'actions' array. Do not return a refusal or a statement that browsing is impossible.
+6. Do NOT fetch individual paywalled article URLs; instead use the search results snippets and the front page summary content.
+7. NEVER fetch the same exact URL twice in the same run.
 
 ## Response Schema
 {
