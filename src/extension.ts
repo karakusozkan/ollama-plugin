@@ -133,6 +133,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const provider = new OllamaProvider();
   provider.outputChannel = outputChannel;  // wire logging
+  // Auto-wire provider endpoint to the first responding candidate (runs async)
+  void provider.autoWireEndpoint().catch((err) => {
+    outputChannel.appendLine(`[startup] autoWireEndpoint failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
   const agent = new Agent(provider);
 
   // ── Initialize MCP Manager ──────────────────────────────────────────────────
@@ -158,6 +162,24 @@ export function activate(context: vscode.ExtensionContext): void {
           outputChannel.appendLine(`✅ ${mcpManager.connectedCount} MCP server(s) connected after config change.`);
         }).catch(err => {
           outputChannel.appendLine(`❌ MCP reconnection error: ${err}`);
+        });
+      }
+    })
+  );
+
+  // Reload provider when endpoint or model settings change so new values are applied immediately
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration("ollamaAgent.endpoint") || e.affectsConfiguration("ollamaAgent.model")) {
+        outputChannel.appendLine("Configuration changed: endpoint/model — reloading provider...");
+        void provider.reload().then(() => {
+          outputChannel.appendLine("[llm] provider.reload completed after config change");
+          try {
+            // Trigger model refresh in the chat view if available
+            (chatViewProvider as any)?._fetchAndSendModels?.();
+          } catch {}
+        }).catch(err => {
+          outputChannel.appendLine(`[llm] provider.reload error: ${err instanceof Error ? err.message : String(err)}`);
         });
       }
     })
@@ -1143,6 +1165,26 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
         this._abortController = null;
         this._view?.webview.postMessage({ type: "clearMessages" });
         this._updateContextDisplay();
+
+        // Reload provider state (clear caches), then reload MCP servers/tools so
+        // plugins are freshly discovered for the new session and models are refreshed.
+        try {
+          try {
+            await (this._provider as any).reload();
+          } catch {
+            // ignore if provider doesn't expose reload
+          }
+          await this._mcpManager.loadFromSettings();
+          // Rebuild system prompt (includes MCP tools description) and refresh model list
+          await this._syncChatSystemPrompt();
+          await this._fetchAndSendModels();
+            // Update context display now that models/system prompt have been refreshed
+            await this._refreshRunningContext();
+        } catch (err) {
+          const msgErr = err instanceof Error ? err.message : String(err);
+          outputChannel.appendLine(`[chat/newSession] failed to reload MCP servers/models: ${msgErr}`);
+        }
+
         return;
       }
       if (msg.type === "selectModel") {

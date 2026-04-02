@@ -82,7 +82,7 @@
 			"properties": {
 				"ollamaAgent.endpoint": {
 					"type": "string",
-					"default": "http://localhost:11434/api/chat",
+					"default": "",
 					"description": "Chat endpoint. Use Ollama-native /api/chat by default, or point it at an OpenAI-compatible /v1/chat/completions endpoint."
 				},
 				"ollamaAgent.model": {

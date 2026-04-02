@@ -55,6 +55,11 @@ export function estimateMessagesTokens(messages: Message[]): number {
 export class OllamaProvider implements LLMProvider {
   outputChannel?: vscode.OutputChannel;
   private readonly _nonStreamingEndpoints = new Set<string>();
+  private _activeEndpoint: string | null = null;
+  // Hold discovered/configured native API endpoints (Ollama `/api/chat` style)
+  private readonly _apiEndpoints = new Set<string>();
+  // Hold discovered/configured OpenAI-style v1 endpoints (/v1 or /v1/chat/completions)
+  private readonly _v1Endpoints = new Set<string>();
 
   private _log(msg: string): void {
     this.outputChannel?.appendLine(msg);
@@ -78,9 +83,201 @@ export class OllamaProvider implements LLMProvider {
     this._log(`[llm/stream] caching non-streaming mode for ${endpoint}: ${reason}`);
   }
 
+  /**
+   * Reload internal provider state (clear caches) so endpoints/plugins
+   * are re-evaluated on the next request.
+   */
+  public async reload(): Promise<void> {
+    this._nonStreamingEndpoints.clear();
+    this._activeEndpoint = null;
+    this._apiEndpoints.clear();
+    this._v1Endpoints.clear();
+    this._log(`[llm] reload: cleared non-streaming endpoint cache and reset active endpoint/endpoints lists`);
+
+    try {
+      await this.autoWireEndpoint();
+      this._log(`[llm] reload: autoWireEndpoint completed`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this._log(`[llm] reload: autoWireEndpoint failed: ${msg}`);
+    }
+  }
+
+  /** Return discovered/configured native API endpoints (Ollama `/api/chat` style). */
+  public get apiEndpoints(): string[] {
+    return Array.from(this._apiEndpoints.values());
+  }
+
+  /** Return discovered/configured OpenAI-style v1 endpoints. */
+  public get v1Endpoints(): string[] {
+    return Array.from(this._v1Endpoints.values());
+  }
+
   private _getEndpoint(): string {
+    if (this._activeEndpoint) return this._activeEndpoint;
     const config = vscode.workspace.getConfiguration("ollamaAgent");
-    return config.get<string>("endpoint", "http://localhost:11434/api/chat");
+    const configured = config.get<string>("endpoint");
+    const env = process.env.OLLAMA_ENDPOINT || process.env.OLLAMA_URL;
+    return (configured && configured.trim()) || (env && env.trim()) || "";
+  }
+
+  /** Probe a list of candidate endpoints and set an active endpoint that responds to discovery. */
+  public async autoWireEndpoint(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("ollamaAgent");
+    const configured = config.get<string>("endpoint", "");
+    const normalized = (configured || "").trim().replace(/\/+$/, "");
+
+    // If the user explicitly configured a native Ollama chat endpoint, prefer it immediately
+    // to avoid probing OpenAI-style discovery paths that can produce double-path requests.
+    if (normalized && /\/api\/chat(?:\/|$)/i.test(normalized)) {
+      this._activeEndpoint = normalized;
+      this._apiEndpoints.add(normalized.replace(/\/+$/, ""));
+      this._log(`[llm/autowire] configured endpoint is explicit Ollama-native: ${this._activeEndpoint}`);
+      return;
+    }
+
+    // If the user explicitly configured an OpenAI-style v1 chat endpoint, prefer it immediately
+    if (normalized && /\/v1(?:\/|$)/i.test(normalized)) {
+      // normalize to either the provided path (if it contains /v1/chat or completions) or to /v1 base
+      const asBase = normalized.replace(/\/v1\/chat(?:\/completions)?(?:\/?$)/i, '/v1').replace(/\/+$/, '');
+      this._activeEndpoint = normalized;
+      this._v1Endpoints.add(asBase);
+      this._log(`[llm/autowire] configured endpoint is explicit OpenAI-style v1: ${this._activeEndpoint}`);
+      return;
+    }
+    // Build two separate candidate lists: one for OpenAI-style (/v1) and one for Ollama-native (/api).
+    const v1Candidates: string[] = [];
+    const nativeCandidates: string[] = [];
+
+    if (normalized) {
+      // If the configured endpoint already looks v1-ish, put it into v1Candidates.
+      if (/\/v1(\/|$)/i.test(normalized) || /models(\/|$)/i.test(normalized) || /chat(\/|$)/i.test(normalized)) {
+        v1Candidates.push(normalized);
+      }
+
+      // If the configured endpoint already looks native (/api), put it into nativeCandidates.
+      if (/\/api(\/|$)/i.test(normalized) || /tags(\/|$)/i.test(normalized)) {
+        nativeCandidates.push(normalized);
+      }
+
+      try {
+        const url = new URL(normalized || "http://localhost");
+        const hostBase = `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ``}`;
+        // Only add host-level candidates if the configured endpoint didn't already include the path.
+        if (!/\/(?:v1|api)\b/i.test(normalized)) {
+          v1Candidates.push(`${hostBase}/v1`);
+          nativeCandidates.push(`${hostBase}/api`);
+        } else {
+          // If configured included a deeper path, also include the host base as a fallback.
+          v1Candidates.push(`${hostBase}/v1`);
+          nativeCandidates.push(`${hostBase}/api`);
+        }
+      } catch {
+        // ignore
+      }
+    } else {
+      // No configured endpoint — probe common env/host fallbacks if available.
+      try {
+        const url = new URL("http://localhost");
+        const hostBase = `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ``}`;
+        v1Candidates.push(`${hostBase}/v1`);
+        nativeCandidates.push(`${hostBase}/api`);
+      } catch {
+        // ignore
+      }
+    }
+
+    // Add endpoints from environment variables if provided (avoid hardcoding other defaults).
+    const envEndpoint = (process.env.OLLAMA_ENDPOINT || process.env.OLLAMA_URL || "").trim().replace(/\/+$/, "");
+    if (envEndpoint) {
+      if (/\/(?:v1)\b/i.test(envEndpoint) || /models(\/|$)/i.test(envEndpoint) || /chat(\/|$)/i.test(envEndpoint)) {
+        v1Candidates.unshift(envEndpoint);
+      }
+      if (/\/(?:api)\b/i.test(envEndpoint) || /tags(\/|$)/i.test(envEndpoint)) {
+        nativeCandidates.unshift(envEndpoint);
+      }
+      // Also include as generic fallback in both lists so we try both discovery flows.
+      v1Candidates.push(envEndpoint);
+      nativeCandidates.push(envEndpoint);
+    } else if (process.env.OLLAMA_HOST) {
+      const host = process.env.OLLAMA_HOST.trim();
+      const port = process.env.OLLAMA_PORT ? `:${process.env.OLLAMA_PORT.trim()}` : "";
+      const hostUrl = `${host.startsWith('http') ? host : `http://${host}`}${port}`;
+      v1Candidates.push(hostUrl);
+      nativeCandidates.push(hostUrl);
+    }
+
+    // Helper to try OpenAI-style discovery on a candidate
+    const tryV1 = async (c: string) => {
+      try {
+        const base = c.replace(/\/+$/, "");
+        const modelsUrl = `${base}/models`;
+        const res = await fetch(modelsUrl, { method: "GET", headers: { "Content-Type": "application/json" } });
+        if (res.ok) {
+          // Prefer using an explicit chat endpoint if candidate already included chat path
+          if (/\/v1\/chat(?:\/|$)/i.test(base) || /chat\/completions(?:\/|$)/i.test(base)) {
+            this._activeEndpoint = base;
+          } else if (/\/v1(?:\/|$)/i.test(base)) {
+            // Candidate points at /v1 base — use that base so downstream logic can build paths.
+            this._activeEndpoint = base;
+          } else {
+            // Candidate is likely a host (no /v1) — set to host/v1 as active endpoint.
+            this._activeEndpoint = `${base}/v1`;
+          }
+          this._log(`[llm/autowire] selected OpenAI-style endpoint: ${this._activeEndpoint}`);
+          // Record v1 base in the v1 list (normalize to base /v1 if needed)
+          const v1Base = (this._activeEndpoint || base).replace(/\/v1\/chat(?:\/completions)?(?:\/?$)/i, '/v1').replace(/\/+$/, '');
+          this._v1Endpoints.add(v1Base);
+          return true;
+        }
+      } catch {
+        // ignore
+      }
+      return false;
+    };
+
+    // Helper to try Ollama-native discovery on a candidate
+    const tryNative = async (c: string) => {
+      try {
+        const base = c.replace(/\/+$/, "");
+        // Try tags discovery
+        const tagsUrl = `${base}/api/tags`;
+        const res2 = await fetch(tagsUrl, { method: "GET", headers: { "Content-Type": "application/json" } });
+        if (res2.ok) {
+          // If candidate already includes /api/chat, use it directly; otherwise normalize to host base + /api/chat
+          if (/\/api\/chat(?:\/|$)/i.test(base)) {
+            this._activeEndpoint = base;
+          } else {
+            // Strip any trailing /api or /api/xxx and append /api/chat
+            const stripped = base.replace(/\/api(\/.*)?$/i, "").replace(/\/+$/, "");
+            this._activeEndpoint = `${stripped}/api/chat`;
+          }
+          // Record the native API endpoint in the api list
+          this._apiEndpoints.add(this._activeEndpoint.replace(/\/+$/, ""));
+          this._log(`[llm/autowire] selected Ollama-native endpoint: ${this._activeEndpoint}`);
+          return true;
+        }
+      } catch {
+        // ignore
+      }
+      return false;
+    };
+
+    // Probe v1 candidates first (prefer OpenAI-style when configured as such)
+    for (const c of v1Candidates) {
+      if (!c) continue;
+      const ok = await tryV1(c);
+      if (ok) return;
+    }
+
+    // Then probe native candidates
+    for (const c of nativeCandidates) {
+      if (!c) continue;
+      const ok = await tryNative(c);
+      if (ok) return;
+    }
+
+    this._log(`[llm/autowire] no candidate endpoints responded; keeping configured endpoint`);
   }
 
   private _getConfiguredModel(): string | undefined {
@@ -157,6 +354,9 @@ export class OllamaProvider implements LLMProvider {
         pathname = pathname.slice(0, -"/api/chat".length);
       } else if (pathname.endsWith("/v1/chat/completions")) {
         pathname = pathname.slice(0, -"/v1/chat/completions".length);
+      } else if (pathname.endsWith("/v1/chat")) {
+        // Support endpoints that point at /v1/chat (OpenAI-style chat path)
+        pathname = pathname.slice(0, -"/v1/chat".length);
       } else if (pathname.endsWith("/chat/completions")) {
         pathname = pathname.slice(0, -"/chat/completions".length);
       }
@@ -170,6 +370,7 @@ export class OllamaProvider implements LLMProvider {
       return endpoint
         .replace(/\/api\/chat\/?$/, "")
         .replace(/\/v1\/chat\/completions\/?$/, "")
+        .replace(/\/v1\/chat\/?$/, "")
         .replace(/\/chat\/completions\/?$/, "")
         .replace(/\/$/, "");
     }
@@ -181,6 +382,10 @@ export class OllamaProvider implements LLMProvider {
       const pathname = url.pathname.replace(/\/+$/, "");
       if (pathname.endsWith("/api/chat")) {
         return "ollama";
+      }
+      // Treat explicit /v1/chat endpoints as OpenAI-compatible chat API
+      if (pathname.endsWith("/v1/chat") || pathname.endsWith("/v1/chat/completions") || pathname.endsWith("/chat/completions")) {
+        return "openai";
       }
     } catch {
       if (endpoint.replace(/\/+$/, "").endsWith("/api/chat")) {
@@ -381,6 +586,9 @@ export class OllamaProvider implements LLMProvider {
 
       if (pathname.endsWith("/chat/completions")) {
         pathname = pathname.slice(0, -"/chat/completions".length);
+      } else if (pathname.endsWith("/v1/chat")) {
+        // /v1/chat should map back to the /v1 base so /models resolves correctly
+        pathname = pathname.slice(0, -"/v1/chat".length);
       } else if (pathname.endsWith("/completions")) {
         pathname = pathname.slice(0, -"/completions".length);
       }
@@ -393,6 +601,7 @@ export class OllamaProvider implements LLMProvider {
     } catch {
       return endpoint
         .replace(/\/chat\/completions\/?$/, "")
+        .replace(/\/v1\/chat\/?$/, "")
         .replace(/\/completions\/?$/, "")
         .replace(/\/$/, "");
     }
@@ -474,28 +683,59 @@ export class OllamaProvider implements LLMProvider {
     const modelsUrl = `${openAiBaseUrl}/models`;
     const errors: string[] = [];
 
-    try {
-      const models = await this._fetchOllamaModels(tagsUrl);
-      this._log(`[models] discovered ${(models || []).length} model(s) via ${tagsUrl}`);
-      if (models && models.length > 0) {
-        return models;
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`GET ${tagsUrl} failed: ${message}`);
-      this._log(`[models] ${errors[errors.length - 1]}`);
-    }
+    const apiKind = this._getChatApiKind();
 
-    try {
-      const models = await this._fetchOpenAiModels(modelsUrl);
-      this._log(`[models] discovered ${(models || []).length} model(s) via ${modelsUrl}`);
-      if (models && models.length > 0) {
-        return models;
+    // If the configured endpoint looks like an OpenAI-style API (starts with /v1),
+    // prefer the OpenAI-compatible discovery flow first to avoid 404 noise from
+    // Ollama-native endpoints.
+    if (apiKind === "openai") {
+      try {
+        const models = await this._fetchOpenAiModels(modelsUrl);
+        this._log(`[models] discovered ${(models || []).length} model(s) via ${modelsUrl}`);
+        if (models && models.length > 0) {
+          return models;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`GET ${modelsUrl} failed: ${message}`);
+        this._log(`[models] ${errors[errors.length - 1]}`);
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`GET ${modelsUrl} failed: ${message}`);
-      this._log(`[models] ${errors[errors.length - 1]}`);
+
+      try {
+        const models = await this._fetchOllamaModels(tagsUrl);
+        this._log(`[models] discovered ${(models || []).length} model(s) via ${tagsUrl}`);
+        if (models && models.length > 0) {
+          return models;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`GET ${tagsUrl} failed: ${message}`);
+        this._log(`[models] ${errors[errors.length - 1]}`);
+      }
+    } else {
+      try {
+        const models = await this._fetchOllamaModels(tagsUrl);
+        this._log(`[models] discovered ${(models || []).length} model(s) via ${tagsUrl}`);
+        if (models && models.length > 0) {
+          return models;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`GET ${tagsUrl} failed: ${message}`);
+        this._log(`[models] ${errors[errors.length - 1]}`);
+      }
+
+      try {
+        const models = await this._fetchOpenAiModels(modelsUrl);
+        this._log(`[models] discovered ${(models || []).length} model(s) via ${modelsUrl}`);
+        if (models && models.length > 0) {
+          return models;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`GET ${modelsUrl} failed: ${message}`);
+        this._log(`[models] ${errors[errors.length - 1]}`);
+      }
     }
 
     const configuredModel = this._getConfiguredModel();
