@@ -1,10 +1,24 @@
-# Ollama Agent
+# Ollama Agentz
 
-An AI coding agent VS Code extension powered by Ollama running locally. This extension provides an intelligent coding assistant that can read, write, and modify files in your workspace, execute shell commands, fetch web content, and integrate with MCP (Model Context Protocol) servers for extended functionality.
+An AI coding plugin for VS Code powered by Ollama running locally. This project provides an intelligent assistant that can read, write, and modify files in your workspace, execute shell commands, fetch web content, and integrate with MCP (Model Context Protocol) servers for extended functionality.
 
 ![Version](https://img.shields.io/badge/version-0.0.1-blue.svg)
 ![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
+
+## What's New
+
+- Improved streaming detection and automatic fallback to buffered responses when servers do not stream as expected.
+- MCP server tooling enhancements: optional `/api/ps` handling, Playwright MCP example, and better error diagnostics.
+- Debugging and logging improvements: output forwarded to Debug Console and key settings logged at startup.
+
+## Compatibility
+
+- **Endpoints supported:** Ollama-native (`/api/tags`, `/api/show`, `/api/chat`) and OpenAI-compatible (`/v1/models`, `/v1/chat/completions`).
+- **Discovery order:** The extension attempts Ollama-native discovery first, then falls back to OpenAI-compatible discovery.
+- **Manual override:** If discovery fails, set `ollamaAgent.endpoint` and `ollamaAgent.model` in settings to point at your server and model.
+- **Streaming behavior:** Streaming is detected automatically; when a server does not stream as expected the extension falls back to buffered responses and caches that behavior for the current session.
+- **Examples:** See the existing "Native Ollama-compatible server example" and "OpenAI-compatible local server example" sections below for configuration snippets.
 
 ## Features
 
