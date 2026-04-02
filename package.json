@@ -2,7 +2,7 @@
 	"name": "ollama-agentz",
 	"displayName": "Ollama agentz",
 	"description": "An AI coding agent powered by Ollama running locally",
-	"version": "0.0.4",
+	"version": "0.0.5",
 	"publisher": "ollama-agentz",
 	"repository": {
 		"type": "git",
