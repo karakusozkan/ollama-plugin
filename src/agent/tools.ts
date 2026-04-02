@@ -28,6 +28,31 @@ export type WebSearchAction = { tool: "web_search"; query: string; server?: stri
 // Append to ToolAction union
 export type ExtendedToolAction = ToolAction | WebSearchAction;
 
+type LegacyActionShape = {
+  action?: string;
+  tool?: string;
+  [key: string]: unknown;
+};
+
+export function normalizeToolActions(actions: unknown): ExtendedToolAction[] {
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+
+  return actions
+    .filter((item): item is LegacyActionShape => typeof item === "object" && item !== null)
+    .map((item) => {
+      if (!item.tool && typeof item.action === "string") {
+        return {
+          ...item,
+          tool: item.action,
+        } as ExtendedToolAction;
+      }
+
+      return item as ExtendedToolAction;
+    });
+}
+
 /**
  * Detect the current operating system and return a descriptor string.
  */
@@ -121,6 +146,7 @@ and you can execute shell commands in the workspace root directory.
 ## Rules
 1. Respond ONLY with valid JSON — no prose, no markdown fences, no code blocks.
 2. Every response must exactly match the schema below.
+2.1. Every entry in "actions" MUST use the field name "tool". Never use "action" as the field name.
 3. All file paths are relative to the workspace root (e.g. "src/index.ts", ".eslintrc.json").
   Never use absolute paths or path traversal (../).
 4. Before editing an EXISTING file you MUST read it first with "read_file" so you
@@ -175,7 +201,12 @@ When the user asks about web content (for example: "Search Google for X" or "Fin
 ## Response Schema
 {
   "thought": "<your reasoning, explanation, or answer to the user>",
-  "actions": [ /* see available tools above for action shapes */ ]
+  "actions": [
+    {
+      "tool": "read_file",
+      "path": "package.json"
+    }
+  ]
 }
 
 Note: when the agent has finished the task it should return an empty "actions" array and place the final answer in the "thought" field.

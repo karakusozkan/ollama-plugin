@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { LLMProvider, Message } from "./llm";
-import { buildSystemPrompt, ToolAction, ExtendedToolAction } from "./tools";
+import { buildSystemPrompt, ExtendedToolAction, normalizeToolActions } from "./tools";
 import { executeActions, ActionResult } from "./executor";
 import { McpManager } from "./mcp.js";
 
@@ -54,7 +54,12 @@ function parseResponse(raw: string): AgentResponse {
     );
   }
 
-  return parsed as AgentResponse;
+  const normalized = parsed as { thought?: unknown; actions: unknown };
+
+  return {
+    thought: typeof normalized.thought === "string" ? normalized.thought : "",
+    actions: normalizeToolActions(normalized.actions),
+  };
 }
 
 /**

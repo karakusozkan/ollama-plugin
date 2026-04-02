@@ -3,7 +3,7 @@ import { Agent } from "./agent/agent";
 import { OllamaProvider, estimateMessagesTokens, OllamaModel } from "./agent/llm";
 import { McpManager, McpServerConfig } from "./agent/mcp";
 import { executeActions } from "./agent/executor";
-import { buildSystemPrompt, ToolAction, ExtendedToolAction } from "./agent/tools";
+import { buildSystemPrompt, ExtendedToolAction, normalizeToolActions } from "./agent/tools";
 
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -59,7 +59,12 @@ function parseSidebarAgentResponse(raw: string): SidebarAgentResponse {
     throw new Error(`Agent response missing required \"actions\" field:\n${JSON.stringify(parsed, null, 2)}`);
   }
 
-  return parsed as SidebarAgentResponse;
+  const normalized = parsed as { thought?: unknown; actions: unknown };
+
+  return {
+    thought: typeof normalized.thought === "string" ? normalized.thought : "",
+    actions: normalizeToolActions(normalized.actions),
+  };
 }
 
 function buildSidebarFeedbackMessage(results: import("./agent/executor").ActionResult[]): string {
